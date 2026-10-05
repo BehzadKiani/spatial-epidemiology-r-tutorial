@@ -1,0 +1,898 @@
+---
+title: "Session 2: Spatial Epidemiology in R"
+subtitle: |
+  Spatial autocorrelation, local clusters, sensitivity analysis and Kulldorff spatial scan statistics  
+  Master of Epidemiology, School of Public Health
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    smooth-scroll: true
+    code-copy: true
+    code-fold: false
+    theme: cosmo
+    embed-resources: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+<div style="display: flex; justify-content: center; gap: 100px; margin-top: 30px; margin-bottom: 35px;">
+
+<div style="text-align: center; width: 220px;">
+<img src="Behzad.png"
+     alt="Dr. Behzad Kiani"
+     style="width: 150px; height: 150px; object-fit: cover; border-radius: 50%;">
+<br>
+<strong>Dr. Behzad Kiani</strong><br>
+<span>The University of Queensland</span>
+</div>
+
+<div style="text-align: center; width: 220px;">
+<img src="Benn.png"
+     alt="Prof. Benn Sartorius"
+     style="width: 150px; height: 150px; object-fit: cover; border-radius: 50%;">
+<br>
+<strong>Prof. Benn Sartorius</strong><br>
+<span>The University of Queensland</span>
+</div>
+
+</div>
+
+::: {.callout-note title="How to use this tutorial"}
+This is a **2-hour guided practical**. Run the code in order. The dataset is `QLD_SA2_Spatial_Epidemiology_Course.gpkg`, containing **533 Queensland SA2s**. The tutorial deliberately uses a small set of packages (`sf`, `ggplot2`, `spdep`, and `SpatialEpi`) so that the focus stays on spatial epidemiological reasoning rather than R syntax.
+:::
+
+# Learning objectives {.unnumbered}
+
+By the end of this session, you should be able to:
+
+- explain why crude disease rates can be unstable in areas with small populations;
+- distinguish **spatial heterogeneity** from **spatial dependence**;
+- define spatial neighbours using **Queen contiguity** and **K-nearest neighbours (KNN)**;
+- calculate and interpret **Global Moran's I**;
+- use **Local Moran's I (LISA)** to identify local clusters and spatial outliers;
+- explain why **multiple testing** matters when interpreting local spatial statistics;
+- assess whether spatial findings are sensitive to the definition of neighbours;
+- run and interpret a **Kulldorff spatial scan statistic**; and
+- explain why a statistically significant spatial cluster does **not** necessarily indicate causation or justify an intervention.
+
+## Suggested timing {.unnumbered}
+
+| Part | Approx. time |
+|---|---:|
+| Data, rates and spatial neighbours | 20 min |
+| Global Moran's I | 15 min |
+| Local Moran's I and LISA mapping | 25 min |
+| Multiple testing | 15 min |
+| Sensitivity to spatial weights | 20 min |
+| Kulldorff spatial scan statistic | 20 min |
+| Interpretation and public-health discussion | 5 min |
+
+# Load the data and packages
+
+Install the packages only once on a computer. The installation chunk below is displayed for students but is **not run automatically** when the tutorial is rendered.
+
+```{r}
+#| eval: false
+
+install.packages("sf")
+install.packages("ggplot2")
+install.packages("spdep")
+install.packages("SpatialEpi")
+```
+
+Now load the packages and read the spatial dataset. This chunk **does run** when the document is rendered.
+
+```{r}
+# Load the packages for this R session.
+library(sf)
+library(ggplot2)
+library(spdep)
+library(SpatialEpi)
+
+# Read the Queensland SA2 spatial dataset.
+qld <- st_read("QLD_SA2_Spatial_Epidemiology_Course.gpkg")
+
+# Inspect the spatial dataset.
+qld
+names(qld)
+head(qld)
+```
+
+The dataset contains **533 Queensland SA2s** represented as MULTIPOLYGON features in the WGS 84 coordinate reference system. The key variables for this practical are `POPULATION`, `CASES`, and `CRUDE_RATE`. The `CRUDE_RATE` variable is already provided as cases per 100,000 population, so we will use it directly rather than recalculating it.
+
+::: {.callout-tip title="Teaching point"}
+Before analysing a spatial dataset, establish the **geographic unit**, **coordinate reference system**, **outcome**, **population denominator**, and whether missing values are present.
+:::
+
+# Explore the disease data
+
+We first inspect the distributions of population, case counts and crude rates, and check whether these variables contain missing values.
+
+```{r}
+# Summarise population, cases and crude disease rates.
+summary(qld$POPULATION)
+summary(qld$CASES)
+summary(qld$CRUDE_RATE)
+
+# Check for missing values.
+sum(is.na(qld$POPULATION))
+sum(is.na(qld$CASES))
+sum(is.na(qld$CRUDE_RATE))
+```
+
+The population sizes vary substantially. This matters because a rate calculated from a very small denominator can change dramatically after only one or two additional cases. A visually extreme crude rate therefore does not automatically mean that the underlying disease risk is truly extreme.
+
+## Map the crude rate
+
+```{r}
+#| fig-width: 8
+#| fig-height: 6
+#| fig-align: center
+
+ggplot(qld) +
+  geom_sf(aes(fill = CRUDE_RATE), colour = "white", linewidth = 0.1) +
+  scale_fill_viridis_c(
+    name = "Rate per\n100,000",
+    direction = -1
+  ) +
+  labs(
+    title = "Crude disease rate by SA2",
+    subtitle = "Queensland"
+  ) +
+  theme_minimal()
+```
+
+::: {.callout-important title="Do not over-interpret the map"}
+The map tells us **where rates differ**. It does not tell us whether neighbouring SA2s are more similar than expected by chance, whether a visible pattern is statistically unusual, or why the pattern exists.
+:::
+
+::: {.callout-question title="Think"}
+If two SA2s both have a rate of 800 per 100,000, but one has a population of 100 and the other 20,000, should you have equal confidence in the two rates?
+:::
+
+# Define spatial neighbours: Queen contiguity
+
+Spatial analysis requires us to define what we mean by a **neighbour**. Under Queen contiguity, two polygons are neighbours if they share either a boundary or a corner.
+
+```{r}
+# Identify Queen-contiguity neighbours.
+queen_nb <- poly2nb(qld, queen = TRUE)
+
+# Count neighbours for each SA2.
+num_neighbours <- card(queen_nb)
+summary(num_neighbours)
+
+# Count SA2s with no Queen neighbours.
+sum(num_neighbours == 0)
+
+# Select and inspect those SA2s.
+no_neighbours <- qld[num_neighbours == 0, ]
+no_neighbours[, c("SA2_CODE", "SA2_NAME")]
+```
+
+Seven SA2s have no Queen-contiguity neighbours. These are geographically isolated areas, mostly islands, so having no shared polygon boundary is plausible rather than necessarily indicating a data problem.
+
+## Map SA2s with no Queen neighbours
+
+```{r}
+#| fig-width: 8
+#| fig-height: 6
+#| fig-align: center
+
+ggplot() +
+  geom_sf(data = qld, fill = "grey90", colour = "white", linewidth = 0.1) +
+  geom_sf(
+    data = no_neighbours,
+    fill = "red",
+    colour = "black",
+    linewidth = 0.4
+  ) +
+  labs(
+    title = "SA2s with no Queen-contiguity neighbours",
+    subtitle = "Highlighted SA2s do not share a boundary or corner with another SA2"
+  ) +
+  theme_minimal()
+```
+
+## Create row-standardised weights
+
+```{r}
+queen_weights <- nb2listw(
+  queen_nb,
+  style = "W",
+  zero.policy = TRUE
+)
+
+queen_weights
+```
+
+`style = "W"` row-standardises the weights: for each SA2, the weights assigned to its neighbours sum to 1. `zero.policy = TRUE` allows the seven isolates to remain in the dataset.
+
+::: {.callout-note title="Spatial dependence versus spatial heterogeneity"}
+**Spatial heterogeneity** means that the level of a variable, or a relationship, varies across space. **Spatial dependence** means that observations close to one another are statistically related. A map can show spatial heterogeneity without proving spatial dependence. Moran's I directly evaluates spatial autocorrelation.
+:::
+
+# Global Moran's I
+
+Global Moran's I asks whether similar values tend to occur near one another across the study area as a whole.
+
+```{r}
+set.seed(123)
+
+moran_result <- moran.mc(
+  qld$CRUDE_RATE,
+  queen_weights,
+  nsim = 999,
+  zero.policy = TRUE
+)
+
+moran_result
+```
+
+The observed Moran's I is approximately **0.525**, with a permutation p-value of **0.001**. This indicates positive spatial autocorrelation: similar crude disease rates tend to occur near one another more than would be expected under random spatial arrangement.
+
+With 999 permutations, the observed statistic is compared with 999 versions of the data in which the observed rates are randomly rearranged across SA2s. Together with the observed dataset, this gives 1,000 possible ranks and a minimum permutation p-value of 0.001.
+
+::: {.callout-tip title="Plain-language interpretation"}
+Across Queensland, SA2s with similar crude disease rates tend to occur near one another more than would be expected if the rates were randomly distributed across the map.
+:::
+
+Global Moran's I does **not** tell us where those local patterns occur. For that, we need a local statistic.
+
+# Local Moran's I (LISA)
+
+Local Moran's I evaluates each SA2 in relation to its neighbours. We use it to identify local clusters and spatial outliers.
+
+```{r}
+local_moran <- localmoran(
+  qld$CRUDE_RATE,
+  queen_weights,
+  zero.policy = TRUE
+)
+
+head(local_moran)
+colnames(local_moran)
+```
+
+The main output includes the local statistic `Ii`, its expected value and variance, a Z-score, and a p-value. Isolates can return `NaN` because they have no Queen-contiguity neighbours.
+
+## Classify LISA patterns
+
+```{r}
+# Overall mean crude rate.
+mean_rate <- mean(qld$CRUDE_RATE)
+
+# Row-standardised mean rate among each SA2's neighbours.
+neighbour_rate <- lag.listw(
+  queen_weights,
+  qld$CRUDE_RATE,
+  zero.policy = TRUE
+)
+
+# Store Local Moran results.
+qld$LOCAL_I <- local_moran[, "Ii"]
+qld$LOCAL_P <- local_moran[, "Pr(z != E(Ii))"]
+
+# Start with all SA2s as not significant.
+qld$LISA_CLUSTER <- "Not significant"
+
+# High-High: high rate surrounded by high rates.
+qld$LISA_CLUSTER[
+  qld$CRUDE_RATE > mean_rate &
+  neighbour_rate > mean_rate &
+  qld$LOCAL_P < 0.05
+] <- "High-High"
+
+# Low-Low: low rate surrounded by low rates.
+qld$LISA_CLUSTER[
+  qld$CRUDE_RATE < mean_rate &
+  neighbour_rate < mean_rate &
+  qld$LOCAL_P < 0.05
+] <- "Low-Low"
+
+# High-Low: high-rate spatial outlier among low-rate neighbours.
+qld$LISA_CLUSTER[
+  qld$CRUDE_RATE > mean_rate &
+  neighbour_rate < mean_rate &
+  qld$LOCAL_P < 0.05
+] <- "High-Low"
+
+# Low-High: low-rate spatial outlier among high-rate neighbours.
+qld$LISA_CLUSTER[
+  qld$CRUDE_RATE < mean_rate &
+  neighbour_rate > mean_rate &
+  qld$LOCAL_P < 0.05
+] <- "Low-High"
+
+table(qld$LISA_CLUSTER)
+```
+
+The four LISA patterns have different meanings: **High-High** and **Low-Low** represent local clustering of similar values; **High-Low** and **Low-High** are spatial outliers, where an SA2 differs from its surrounding neighbours.
+
+## Map the LISA categories
+
+```{r}
+qld$LISA_CLUSTER <- factor(
+  qld$LISA_CLUSTER,
+  levels = c(
+    "High-High",
+    "Low-Low",
+    "High-Low",
+    "Low-High",
+    "Not significant"
+  )
+)
+
+ggplot(qld) +
+  geom_sf(aes(fill = LISA_CLUSTER), colour = "white", linewidth = 0.1) +
+  scale_fill_manual(
+    values = c(
+      "High-High" = "red3",
+      "Low-Low" = "blue3",
+      "High-Low" = "pink",
+      "Low-High" = "lightblue",
+      "Not significant" = "grey90"
+    ),
+    name = "LISA cluster"
+  ) +
+  labs(
+    title = "Local Moran's I (LISA) cluster map",
+    subtitle = "Crude disease rates by Queensland SA2 (p < 0.05)"
+  ) +
+  theme_minimal()
+```
+
+## Zoom to Southeast Queensland
+
+The statewide map is useful for the overall pattern, but small SA2s can be difficult to see. The following map uses the **same analysis and classifications** and changes only the display extent.
+
+```{r}
+#| fig-width: 8
+#| fig-height: 6
+#| fig-align: center
+
+ggplot(qld) +
+  geom_sf(aes(fill = LISA_CLUSTER), colour = "white", linewidth = 0.1) +
+  scale_fill_manual(
+    values = c(
+      "High-High" = "red3",
+      "Low-Low" = "blue3",
+      "High-Low" = "pink",
+      "Low-High" = "lightblue",
+      "Not significant" = "grey90"
+    ),
+    name = "LISA cluster"
+  ) +
+  coord_sf(
+    xlim = c(152.5, 153.4),
+    ylim = c(-28.0, -26.5)
+  ) +
+  labs(
+    title = "LISA clusters: Southeast Queensland",
+    subtitle = "Same analysis as the statewide map; display extent only is changed"
+  ) +
+  theme_minimal()
+```
+
+::: {.callout-important title="A High-High area is not a causal finding"}
+A High-High classification means that an SA2 with a relatively high rate is surrounded by neighbours with relatively high rates and the local statistic is significant under the chosen analysis. It does **not** establish an outbreak, exposure, mechanism or cause.
+:::
+
+# Multiple testing and False Discovery Rate
+
+A separate Local Moran test is performed for many SA2s. When many hypothesis tests are conducted, some small p-values can occur by chance. We therefore examine an FDR-adjusted version of the local results.
+
+```{r}
+# Adjust the Local Moran p-values using the false discovery rate.
+qld$LOCAL_P_FDR <- p.adjust(
+  qld$LOCAL_P,
+  method = "fdr"
+)
+
+# Compare the number significant before and after FDR adjustment.
+sum(qld$LOCAL_P < 0.05, na.rm = TRUE)
+sum(qld$LOCAL_P_FDR < 0.05, na.rm = TRUE)
+
+# Retain the LISA class only if it remains significant after FDR adjustment.
+qld$LISA_FDR <- as.character(qld$LISA_CLUSTER)
+
+qld$LISA_FDR[
+  is.na(qld$LOCAL_P_FDR) |
+  qld$LOCAL_P_FDR >= 0.05
+] <- "Not significant"
+
+table(qld$LISA_FDR)
+```
+
+The number of significant local results falls from **105 to 46** after FDR adjustment. The areas that no longer meet the threshold should **not** be described as “false clusters”; rather, they did not remain statistically significant after controlling the false discovery rate.
+
+## Map the FDR-adjusted LISA categories
+
+```{r}
+qld$LISA_FDR <- factor(
+  qld$LISA_FDR,
+  levels = c(
+    "High-High",
+    "Low-Low",
+    "High-Low",
+    "Low-High",
+    "Not significant"
+  )
+)
+
+ggplot(qld) +
+  geom_sf(aes(fill = LISA_FDR), colour = "white", linewidth = 0.1) +
+  scale_fill_manual(
+    values = c(
+      "High-High" = "red3",
+      "Low-Low" = "blue3",
+      "High-Low" = "pink",
+      "Low-High" = "lightblue",
+      "Not significant" = "grey90"
+    ),
+    drop = FALSE,
+    name = "LISA cluster"
+  ) +
+  labs(
+    title = "FDR-adjusted Local Moran's I (LISA) cluster map",
+    subtitle = "Crude disease rates by Queensland SA2 (FDR-adjusted p < 0.05)"
+  ) +
+  theme_minimal()
+```
+
+## Zoom to Southeast Queensland after FDR adjustment
+
+```{r}
+#| fig-width: 8
+#| fig-height: 6
+#| fig-align: center
+
+ggplot(qld) +
+  geom_sf(aes(fill = LISA_FDR), colour = "white", linewidth = 0.1) +
+  scale_fill_manual(
+    values = c(
+      "High-High" = "red3",
+      "Low-Low" = "blue3",
+      "High-Low" = "pink",
+      "Low-High" = "lightblue",
+      "Not significant" = "grey90"
+    ),
+    drop = FALSE,
+    name = "LISA cluster"
+  ) +
+  coord_sf(
+    xlim = c(152.5, 153.4),
+    ylim = c(-28.0, -26.5)
+  ) +
+  labs(
+    title = "FDR-adjusted LISA clusters: Southeast Queensland",
+    subtitle = "Zoom changes the display extent only, not the analysis"
+  ) +
+  theme_minimal()
+```
+
+## Zoom to Central Queensland after FDR adjustment
+
+```{r}
+#| fig-width: 8
+#| fig-height: 6
+#| fig-align: center
+
+ggplot(qld) +
+  geom_sf(aes(fill = LISA_FDR), colour = "white", linewidth = 0.1) +
+  scale_fill_manual(
+    values = c(
+      "High-High" = "red3",
+      "Low-Low" = "blue3",
+      "High-Low" = "pink",
+      "Low-High" = "lightblue",
+      "Not significant" = "grey90"
+    ),
+    drop = FALSE,
+    name = "LISA cluster"
+  ) +
+  coord_sf(
+    xlim = c(150.7, 151.5),
+    ylim = c(-24.5, -23.5)
+  ) +
+  labs(
+    title = "FDR-adjusted LISA clusters: Central Queensland",
+    subtitle = "Zoom changes the display extent only, not the analysis"
+  ) +
+  theme_minimal()
+```
+
+::: {.callout-tip title="Teaching point"}
+Local cluster maps can look compelling. Multiple-testing adjustment reminds us that visual prominence is not the same as statistical robustness.
+:::
+
+# Sensitivity to the definition of neighbours
+
+There is rarely only one defensible spatial weights matrix. Queen contiguity represents shared boundaries or corners. An alternative is **K-nearest neighbours (KNN)**, where every SA2 is linked to a fixed number of geographically closest SA2s.
+
+We use four nearest neighbours and projected coordinates (Australian Albers, EPSG:3577) so that distance calculations are performed in a suitable projected coordinate system.
+
+```{r}
+# Project Queensland polygons to Australian Albers.
+qld_projected <- st_transform(qld, 3577)
+
+# Create one representative point inside each SA2.
+sa2_points <- st_point_on_surface(qld_projected)
+sa2_coordinates <- st_coordinates(sa2_points)
+
+# Find the four nearest neighbours for every SA2.
+knn_object <- knearneigh(sa2_coordinates, k = 4)
+knn_nb <- knn2nb(knn_object)
+
+# Check the neighbour counts.
+knn_num_neighbours <- card(knn_nb)
+summary(knn_num_neighbours)
+sum(knn_num_neighbours == 0)
+
+# Convert to row-standardised weights.
+knn_weights <- nb2listw(knn_nb, style = "W")
+```
+
+Every SA2 has exactly four neighbours under this definition, so there are no isolates. Unlike Queen contiguity, KNN guarantees neighbours for islands and geographically isolated polygons. However, KNN relationships can be non-symmetric: A can be among B's four closest neighbours without B necessarily being among A's four closest neighbours.
+
+## Repeat Global Moran's I
+
+```{r}
+set.seed(123)
+
+moran_knn <- moran.mc(
+  qld$CRUDE_RATE,
+  knn_weights,
+  nsim = 999
+)
+
+moran_knn
+```
+
+The Queen-contiguity Moran's I is approximately **0.525**, while the 4-NN Moran's I is approximately **0.536**; both permutation p-values are **0.001**. The global conclusion is therefore very similar under both reasonable neighbour definitions.
+
+## Repeat Local Moran's I and FDR adjustment
+
+```{r}
+# Local Moran's I using 4-nearest-neighbour weights.
+local_moran_knn <- localmoran(
+  qld$CRUDE_RATE,
+  knn_weights
+)
+
+qld$LOCAL_I_KNN <- local_moran_knn[, "Ii"]
+qld$LOCAL_P_KNN <- local_moran_knn[, "Pr(z != E(Ii))"]
+qld$LOCAL_P_KNN_FDR <- p.adjust(
+  qld$LOCAL_P_KNN,
+  method = "fdr"
+)
+
+# Compare significant results before and after FDR.
+sum(qld$LOCAL_P_KNN < 0.05, na.rm = TRUE)
+sum(qld$LOCAL_P_KNN_FDR < 0.05, na.rm = TRUE)
+
+# Calculate the spatial lag under 4-NN weights.
+neighbour_rate_knn <- lag.listw(
+  knn_weights,
+  qld$CRUDE_RATE
+)
+
+# Classify FDR-adjusted KNN LISA results.
+qld$LISA_KNN_FDR <- "Not significant"
+
+qld$LISA_KNN_FDR[
+  qld$CRUDE_RATE > mean_rate &
+  neighbour_rate_knn > mean_rate &
+  qld$LOCAL_P_KNN_FDR < 0.05
+] <- "High-High"
+
+qld$LISA_KNN_FDR[
+  qld$CRUDE_RATE < mean_rate &
+  neighbour_rate_knn < mean_rate &
+  qld$LOCAL_P_KNN_FDR < 0.05
+] <- "Low-Low"
+
+qld$LISA_KNN_FDR[
+  qld$CRUDE_RATE > mean_rate &
+  neighbour_rate_knn < mean_rate &
+  qld$LOCAL_P_KNN_FDR < 0.05
+] <- "High-Low"
+
+qld$LISA_KNN_FDR[
+  qld$CRUDE_RATE < mean_rate &
+  neighbour_rate_knn > mean_rate &
+  qld$LOCAL_P_KNN_FDR < 0.05
+] <- "Low-High"
+
+table(qld$LISA_KNN_FDR)
+
+# Compare Queen and KNN classifications.
+table(
+  Queen = qld$LISA_FDR,
+  KNN = qld$LISA_KNN_FDR
+)
+
+# Identify SA2s whose classification changed.
+changed_sa2 <- qld[
+  as.character(qld$LISA_FDR) != qld$LISA_KNN_FDR,
+]
+
+nrow(changed_sa2)
+
+# Show the changed SA2s.
+changed_sa2[, c("SA2_NAME", "LISA_FDR", "LISA_KNN_FDR")]
+```
+
+Only **19 of 533 SA2s** changed classification, so about **96.4%** retained the same FDR-adjusted classification. This suggests broad robustness while also showing that local conclusions for particular SA2s can depend on how neighbours are defined.
+
+## Map where the classifications changed
+
+```{r}
+#| fig-width: 8
+#| fig-height: 6
+#| fig-align: center
+
+qld$WEIGHTS_CHANGE <- "Same classification"
+
+qld$WEIGHTS_CHANGE[
+  as.character(qld$LISA_FDR) != qld$LISA_KNN_FDR
+] <- "Changed classification"
+
+ggplot(qld) +
+  geom_sf(
+    fill = "grey90",
+    colour = "white",
+    linewidth = 0.1
+  ) +
+  geom_sf(
+    data = qld[qld$WEIGHTS_CHANGE == "Changed classification", ],
+    fill = "orange",
+    colour = "black",
+    linewidth = 0.3
+  ) +
+  labs(
+    title = "Sensitivity of local clusters to spatial weights",
+    subtitle = "Highlighted SA2s changed classification between Queen and 4-nearest-neighbour weights"
+  ) +
+  theme_minimal()
+```
+
+::: {.callout-question title="Discuss"}
+If an SA2 is identified as a hotspot using one reasonable neighbour definition but not another, how confident should we be about acting on that individual result?
+:::
+
+# Kulldorff spatial scan statistic
+
+Local Moran's I asks whether each location resembles its neighbours. The **Kulldorff spatial scan statistic** asks a different question: are there geographic windows in which the observed number of cases is unusually high relative to the number expected from the population at risk?
+
+Here we use a **spatial-only Poisson scan**. No time dimension is introduced.
+
+## Prepare the inputs
+
+```{r}
+# Representative points for the spatial scan.
+scan_points <- st_point_on_surface(qld_projected)
+scan_geo <- st_coordinates(scan_points)
+
+# Observed cases and population.
+scan_cases <- qld$CASES
+scan_population <- qld$POPULATION
+
+# Queensland-wide disease rate.
+overall_rate <- sum(scan_cases) / sum(scan_population)
+
+# Expected cases if all SA2s had the same underlying rate.
+scan_expected <- scan_population * overall_rate
+
+# Display the overall rate per 100,000.
+overall_rate * 100000
+
+# Compare observed and expected cases for the first few SA2s.
+head(
+  data.frame(
+    SA2_NAME = qld$SA2_NAME,
+    Observed = scan_cases,
+    Expected = scan_expected
+  )
+)
+```
+
+`Expected` is the SA2 population multiplied by the Queensland-wide rate. It is therefore the number of cases expected if the same underlying disease rate applied everywhere.
+
+## Run the scan
+
+We use a maximum scanning window containing **10% of the Queensland population**. This is an analytical choice, not a universal correct value.
+
+```{r}
+set.seed(123)
+
+scan_result <- kulldorff(
+  geo = scan_geo,
+  cases = scan_cases,
+  population = scan_population,
+  expected.cases = scan_expected,
+  pop.upper.bound = 0.10,
+  n.simulations = 999,
+  alpha.level = 0.05
+)
+
+# Inspect the most likely cluster rather than printing the large full object.
+scan_result$most.likely.cluster
+```
+
+The most likely cluster contains **41 SA2s**, with **1,964 observed cases** compared with approximately **1,232.6 expected cases**. Its SMR is approximately **1.59**, meaning that the cluster contains about **59% more observed cases than expected** under equal statewide risk. The Monte Carlo p-value is **0.001**.
+
+“Most likely cluster” means the candidate window with the strongest statistical evidence according to the scan statistic. It does not mean that the cluster is certainly causal or that every SA2 inside it has an individually elevated crude rate.
+
+## Map the most likely cluster
+
+```{r}
+#| fig-width: 8
+#| fig-height: 6
+#| fig-align: center
+
+main_cluster_ids <- scan_result$most.likely.cluster$location.IDs.included
+
+qld$SCAN_CLUSTER <- "Outside cluster"
+qld$SCAN_CLUSTER[main_cluster_ids] <- "Most likely cluster"
+
+table(qld$SCAN_CLUSTER)
+
+ggplot(qld) +
+  geom_sf(
+    fill = "grey90",
+    colour = "white",
+    linewidth = 0.1
+  ) +
+  geom_sf(
+    data = qld[qld$SCAN_CLUSTER == "Most likely cluster", ],
+    fill = "red3",
+    colour = "white",
+    linewidth = 0.2
+  ) +
+  labs(
+    title = "Most likely Kulldorff spatial cluster",
+    subtitle = "Poisson spatial scan statistic, maximum population window = 10%"
+  ) +
+  theme_minimal()
+```
+
+::: {.callout-note title="Important nuance"}
+An individual SA2 inside a detected scan window does not have to have a high crude rate by itself. The scan evaluates the **combined geographic window**. For example, Callemondah has zero cases in this dataset but lies within the most likely multi-SA2 cluster.
+:::
+
+## Map all significant clusters
+
+```{r}
+# Create a cluster label for every SA2.
+qld$KULLDORFF_CLUSTER <- "Not in cluster"
+
+# Add the most likely cluster.
+qld$KULLDORFF_CLUSTER[
+  scan_result$most.likely.cluster$location.IDs.included
+] <- "Cluster 1"
+
+# Add the significant secondary clusters.
+for (i in seq_along(scan_result$secondary.clusters)) {
+  cluster_ids <- scan_result$secondary.clusters[[i]]$location.IDs.included
+  qld$KULLDORFF_CLUSTER[cluster_ids] <- paste0("Cluster ", i + 1)
+}
+
+table(qld$KULLDORFF_CLUSTER)
+
+# Set a consistent order for the map legend.
+qld$KULLDORFF_CLUSTER <- factor(
+  qld$KULLDORFF_CLUSTER,
+  levels = c(
+    "Cluster 1",
+    "Cluster 2",
+    "Cluster 3",
+    "Cluster 4",
+    "Cluster 5",
+    "Cluster 6",
+    "Not in cluster"
+  )
+)
+
+ggplot(qld) +
+  geom_sf(
+    aes(fill = KULLDORFF_CLUSTER),
+    colour = "white",
+    linewidth = 0.1
+  ) +
+  scale_fill_manual(
+    values = c(
+      "Cluster 1" = "red3",
+      "Cluster 2" = "darkorange",
+      "Cluster 3" = "gold",
+      "Cluster 4" = "purple",
+      "Cluster 5" = "dodgerblue3",
+      "Cluster 6" = "green3",
+      "Not in cluster" = "grey90"
+    ),
+    name = "Spatial cluster"
+  ) +
+  labs(
+    title = "Kulldorff spatial clusters of disease risk",
+    subtitle = "Significant clusters from the Poisson spatial scan statistic"
+  ) +
+  theme_minimal()
+```
+
+## Summarise the detected clusters
+
+```{r}
+# Combine the most likely and secondary clusters.
+all_clusters <- c(
+  list(scan_result$most.likely.cluster),
+  scan_result$secondary.clusters
+)
+
+# Create an empty results table.
+cluster_summary <- data.frame()
+
+# Extract the key result from each cluster.
+for (i in seq_along(all_clusters)) {
+  cl <- all_clusters[[i]]
+
+  cluster_summary <- rbind(
+    cluster_summary,
+    data.frame(
+      Cluster = paste0("Cluster ", i),
+      Population = cl$population,
+      Observed = cl$number.of.cases,
+      Expected = round(cl$expected.cases, 1),
+      SMR = round(cl$SMR, 2),
+      P_value = cl$p.value
+    )
+  )
+}
+
+cluster_summary
+```
+
+In this analysis, all six retained clusters have SMRs above 1, so they represent **significant high-risk spatial clusters**. “Most likely” does not simply mean “the cluster with the most cases”; it refers to the candidate window with the strongest statistical evidence according to the scan statistic.
+
+::: {.callout-question title="Compare the methods"}
+Look back at the **Central Queensland FDR-adjusted LISA map** and compare it with the Kulldorff results. Do the methods highlight broadly similar parts of Queensland? Why might the boundaries differ even when the general spatial signal is similar?
+:::
+
+# From statistical cluster to public-health interpretation
+
+The analyses have now answered several different spatial questions. The crude map showed geographic variation. Global Moran's I showed overall positive spatial autocorrelation. Local Moran's I identified local clusters and outliers, and FDR adjustment showed how multiple testing changes the local picture. The KNN analysis showed that the global result was robust while a small number of local classifications depended on the neighbour definition. The Kulldorff scan identified geographic windows containing more cases than expected from their populations.
+
+None of those findings, by themselves, explain **why** risk is elevated.
+
+::: {.callout-warning title="Statistical cluster ≠ causal explanation"}
+A cluster can generate a hypothesis and guide further investigation. It does not establish that a particular environmental, socioeconomic, behavioural, occupational, infectious or healthcare-related factor caused the pattern.
+:::
+
+## Small-group activity: would you act on this hotspot?
+
+Imagine that you work in a Queensland public-health team and receive the Cluster 1 result. Before recommending an intervention, what additional evidence would you want?
+
+Consider factors such as age and sex structure; disease ascertainment, testing and reporting; healthcare access; population mobility and travel; environmental and climatic exposures; occupational exposures; socioeconomic factors; temporal persistence; data quality and geocoding; changes in population denominators; plausible transmission pathways; confounding; and whether a stronger observational or causal study design is needed.
+
+::: {.callout-question title="Discussion prompt"}
+What evidence would make you more confident that the detected cluster represents a meaningful public-health signal rather than a statistical pattern requiring further investigation?
+:::
+
+# Take-home messages
+
+1. **Crude rates can be unstable**, particularly where population denominators are small.
+2. A disease map shows **spatial heterogeneity**, but not necessarily spatial dependence.
+3. Spatial results depend on how **neighbours and weights** are defined.
+4. **Global Moran's I** assesses overall spatial autocorrelation; it does not locate clusters.
+5. **Local Moran's I** identifies local clusters and spatial outliers, but involves many simultaneous tests.
+6. **FDR adjustment** can substantially reduce the number of local results meeting the significance threshold.
+7. **Sensitivity analysis** is part of spatial epidemiology, not an optional afterthought.
+8. **Kulldorff's spatial scan statistic** identifies geographic windows with unusual observed-versus-expected case counts.
+9. A **statistically significant spatial cluster is not a causal explanation** and should usually be treated as a signal for further investigation.
+
+::: {.callout-tip title="Final question"}
+If two reasonable spatial methods identify broadly similar high-risk areas, does that prove the pattern is causal? **No.** It increases confidence that the spatial pattern is not purely an artefact of one analytical definition, but causal interpretation still requires appropriate data, design and subject-matter evidence.
+:::
