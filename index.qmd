@@ -73,6 +73,16 @@ By the end of this session, you should be able to:
 
 # Load the data and packages
 
+::: {.callout-tip}
+## Download the teaching dataset
+
+Before starting the practical, download the Queensland SA2 teaching dataset:
+
+[**⬇ Download QLD SA2 Spatial Epidemiology Dataset (.gpkg)**](https://github.com/BehzadKiani/spatial-epidemiology-r-tutorial/raw/refs/heads/main/QLD_SA2_Spatial_Epidemiology_Course.gpkg)
+
+Save the downloaded file in the **same folder as this Quarto (`.qmd`) file**.
+:::
+
 Install the packages only once on a computer. The installation chunk below is displayed for students but is **not run automatically** when the tutorial is rendered.
 
 ```{r}
@@ -86,12 +96,16 @@ install.packages("SpatialEpi")
 
 Now load the packages and read the spatial dataset. This chunk **does run** when the document is rendered.
 
+
+
 ```{r}
 # Load the packages for this R session.
 library(sf)
 library(ggplot2)
 library(spdep)
 library(SpatialEpi)
+
+
 
 # Read the Queensland SA2 spatial dataset.
 qld <- st_read("QLD_SA2_Spatial_Epidemiology_Course.gpkg")
