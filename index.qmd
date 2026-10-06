@@ -80,7 +80,6 @@ Before starting the practical, download the Queensland SA2 teaching dataset:
 
 [**⬇ Download QLD SA2 Spatial Epidemiology Dataset (.gpkg)**](https://github.com/BehzadKiani/spatial-epidemiology-r-tutorial/raw/refs/heads/main/QLD_SA2_Spatial_Epidemiology_Course.gpkg)
 
-Save the downloaded file in the **same folder as this Quarto (`.qmd`) file**.
 :::
 
 Install the packages only once on a computer. The installation chunk below is displayed for students but is **not run automatically** when the tutorial is rendered.
