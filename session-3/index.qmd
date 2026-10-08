@@ -1,0 +1,2201 @@
+---
+title: "Session 3: Spatial Interpolation and Smoothing in R"
+subtitle: "Queensland rainfall and SA2 disease rates | Hands-on spatial epidemiology"
+format:
+  html:
+    theme: cosmo
+    embed-resources: true
+    toc: true
+    toc-depth: 3
+    number-sections: false
+    code-fold: false
+    code-copy: true
+    df-print: paged
+    fig-width: 9
+    fig-height: 7
+    fig-align: center
+execute:
+  echo: true
+  warning: false
+  message: false
+  cache: false
+editor: source
+---
+
+## Learning objectives
+
+By the end of this tutorial, you should be able to prepare spatial data in a projected coordinate system; explain and apply nearest-neighbour, inverse distance weighting (IDW), and ordinary kriging interpolation; assess interpolation with leave-one-out cross-validation; explain and map global empirical Bayes and neighbourhood-pooled disease rates; and demonstrate how bandwidth changes a kernel density estimate (KDE).
+
+**Three questions to keep separate:** Interpolation asks *what value might occur at an unmeasured location?* Disease-rate smoothing asks *how can unstable rates across areas be stabilised?* KDE asks *where are point events concentrated?* These are related spatial techniques but not interchangeable.
+
+## Download the tutorial datasets
+
+Download the following datasets before running the practical exercises:
+
+- **[Queensland daily rainfall data, 2024 (CSV)](QLD_SILO_Daily_Rainfall_2024_raw.csv)** — daily rainfall records used in Part A.
+- **[Queensland boundary shapefile (ZIP)](QLD%20area.zip)** — download and extract the ZIP file before running Part A.
+- **[Queensland SA2 spatial epidemiology dataset (GeoPackage)](QLD_SA2_Spatial_Epidemiology_Course.gpkg)** — population, disease cases, and crude rates used in Parts B and C.
+
+Download all three datasets and place the extracted files in the same folder as `index.qmd` before running the exercises in order. The shapefile ZIP should contain its `.shp`, `.shx`, `.dbf`, and `.prj` components. For GitHub Pages, the three downloadable files must also be uploaded alongside the published HTML. `embed-resources: true` embeds page assets such as figures, but does not embed these downloadable datasets.
+
+**Data interpretation:** Some annual rainfall totals include a small number of SILO-filled days, even after the 95% observation-based completeness filter. The SA2 dataset contains aggregated case counts, not individual case locations.
+
+## Part A: Spatial interpolation of rainfall
+
+### 2. Load The Required Packages
+
+```{r}
+# Load packages for data manipulation, mapping,
+# raster analysis, and spatial interpolation.
+library(tidyverse)
+library(sf)
+library(terra)
+library(gstat)
+```
+
+### 3. Import The Queensland Rainfall Data
+
+```{r}
+# Read daily rainfall data for Queensland weather stations
+# during 2024.
+rainfall_daily <- read_csv(
+  "QLD_SILO_Daily_Rainfall_2024_raw.csv",
+  show_col_types = FALSE
+)
+
+
+# Examine the structure of the dataset.
+glimpse(rainfall_daily)
+```
+
+### 4. Explore The Rainfall Data
+
+```{r}
+# Count the total number of daily rainfall records.
+nrow(rainfall_daily)
+
+
+# Count the number of unique rainfall stations.
+n_distinct(
+  rainfall_daily$station_code
+)
+
+
+# Check the date range.
+range(
+  rainfall_daily$date
+)
+
+
+# Look at the first few records.
+head(
+  rainfall_daily
+)
+
+
+# CHECK THE NUMBER OF DAYS AVAILABLE FOR EACH STATION
+
+# 2024 was a leap year and therefore contained 366 days.
+days_in_year <- 366
+
+
+# Count the number of daily records for each station.
+station_days <- rainfall_daily |>
+  count(
+    station_code,
+    station_name,
+    name = "DAYS"
+  )
+
+
+# Summarise the number of records per station.
+summary(
+  station_days$DAYS
+)
+
+
+# Identify any stations that do not have 366 daily records.
+station_days |>
+  filter(
+    DAYS != days_in_year
+  )
+```
+
+### 5. Examine Rainfall Data Quality
+
+```{r}
+# SILO provides a source code for each daily rainfall value.
+#
+# In this dataset:
+#
+# 0  = direct Bureau of Meteorology observation
+#
+# 15 = rainfall based on an accumulated station observation
+#      that SILO redistributed across the relevant days
+#
+# 25 = rainfall estimated using spatial interpolation
+#
+# We will treat source codes 0 and 15 as
+# observation-based rainfall.
+
+
+# Count records belonging to each rainfall source.
+table(
+  rainfall_daily$rainfall_source,
+  useNA = "ifany"
+)
+
+
+# Create a variable identifying observation-based rainfall.
+rainfall_daily <- rainfall_daily |>
+  mutate(
+    OBSERVATION_BASED =
+      rainfall_source %in% c(0, 15)
+  )
+
+
+# Check the number of observation-based and
+# interpolated daily records.
+table(
+  rainfall_daily$OBSERVATION_BASED
+)
+```
+
+### 6. Calculate Station Completeness
+
+```{r}
+# Summarise the daily data to produce one record
+# for each rainfall station.
+station_summary <- rainfall_daily |>
+  
+  group_by(
+    station_code,
+    station_name,
+    latitude,
+    longitude
+  ) |>
+  
+  summarise(
+    
+    # Number of observation-based days.
+    DAYS_OBSERVED = sum(
+      OBSERVATION_BASED,
+      na.rm = TRUE
+    ),
+    
+    # Number of days interpolated by SILO.
+    DAYS_INTERPOLATED = sum(
+      rainfall_source == 25,
+      na.rm = TRUE
+    ),
+    
+    # Percentage of the year supported by
+    # observation-based rainfall.
+    COMPLETENESS = 100 *
+      DAYS_OBSERVED /
+      days_in_year,
+    
+    # Total annual rainfall using the complete
+    # daily SILO rainfall series.
+    ANNUAL_RAINFALL = sum(
+      rainfall,
+      na.rm = TRUE
+    ),
+    
+    .groups = "drop"
+  )
+
+
+# Examine the station-level dataset.
+glimpse(
+  station_summary
+)
+
+
+# EXAMINE STATION COMPLETENESS
+
+# Summarise completeness across all stations.
+summary(
+  station_summary$COMPLETENESS
+)
+
+
+# Plot the distribution of station completeness.
+ggplot(
+  station_summary,
+  aes(
+    x = COMPLETENESS
+  )
+) +
+  
+  geom_histogram(
+    binwidth = 5,
+    boundary = 0
+  ) +
+  
+  labs(
+    title = "Completeness of rainfall observations",
+    subtitle = "Queensland rainfall stations, 2024",
+    x = "Observation-based days (%)",
+    y = "Number of stations"
+  ) +
+  
+  theme_minimal()
+
+
+# RETAIN STATIONS WITH AT LEAST 95% COMPLETENESS
+
+# Stations must have observation-based rainfall
+# for at least 95% of the year.
+rainfall_stations <- station_summary |>
+  filter(
+    COMPLETENESS >= 95
+  )
+
+
+# Count the retained stations.
+nrow(
+  rainfall_stations
+)
+
+
+# CHECK THE FINAL COMPLETENESS OF RETAINED STATIONS
+
+summary(
+  rainfall_stations$COMPLETENESS
+)
+
+
+# Check the number of SILO-interpolated days
+# among the retained stations.
+summary(
+  rainfall_stations$DAYS_INTERPOLATED
+)
+
+
+# Look at the first few retained stations.
+head(
+  rainfall_stations
+)
+
+
+#
+# Expected result:
+#
+# 873 original rainfall stations
+#       ↓
+# Data-quality assessment
+#       ↓
+# 95% observation-based completeness threshold
+#       ↓
+# 433 rainfall stations retained for spatial interpolation
+#
+```
+
+### 7. Prepare And Map The Rainfall Stations
+
+```{r}
+#
+# We now convert the rainfall stations into spatial points
+# and prepare them for spatial interpolation.
+#
+# Spatial interpolation relies on distances between locations.
+# Therefore, we will transform the data from geographic
+# coordinates (longitude/latitude) to a projected coordinate
+# reference system suitable for Australia.
+#
+# We use GDA2020 / Australian Albers (EPSG:3577).
+#
+```
+
+#### 7.1 Convert rainfall stations to spatial points
+
+```{r}
+# The station coordinates are currently stored as
+# longitude and latitude.
+#
+# EPSG:4326 represents geographic coordinates using
+# longitude and latitude in degrees.
+
+rainfall_stations_sf <- st_as_sf(
+  rainfall_stations,
+  coords = c(
+    "longitude",
+    "latitude"
+  ),
+  crs = 4326,
+  remove = FALSE
+)
+
+
+# Examine the spatial object.
+rainfall_stations_sf
+
+
+# Check its coordinate reference system.
+st_crs(
+  rainfall_stations_sf
+)
+```
+
+#### 7.2 Transform stations to australian albers
+
+```{r}
+# Longitude and latitude are measured in degrees.
+# For distance-based spatial analysis, a projected CRS
+# measured in metres is more appropriate.
+#
+# EPSG:3577 is GDA2020 / Australian Albers.
+
+rainfall_stations_3577 <- st_transform(
+  rainfall_stations_sf,
+  crs = 3577
+)
+
+
+# Check the new CRS.
+st_crs(
+  rainfall_stations_3577
+)
+```
+
+#### 7.3 Check the annual rainfall values
+
+```{r}
+# Examine the distribution of annual rainfall across
+# the retained stations.
+
+summary(
+  rainfall_stations_3577$ANNUAL_RAINFALL
+)
+```
+
+#### 7.4 Map the rainfall stations
+
+```{r}
+# First, map the stations using their longitude and latitude.
+#
+# Darker points represent stations with higher annual
+# rainfall totals.
+
+ggplot(
+  rainfall_stations_sf
+) +
+  
+  geom_sf(
+    aes(
+      colour = ANNUAL_RAINFALL
+    ),
+    size = 2
+  ) +
+  
+  scale_colour_viridis_c(
+    option = "viridis",
+    direction = -1,
+    name = "Annual rainfall\n(mm)"
+  ) +
+  
+  labs(
+    title = "Annual rainfall at Queensland weather stations",
+    subtitle = "Stations with at least 95% observation-based completeness, 2024",
+    x = "Longitude",
+    y = "Latitude"
+  ) +
+  
+  theme_minimal()
+```
+
+#### 7.5 Map station completeness
+
+```{r}
+# Although all retained stations have at least 95%
+# observation-based completeness, this map allows us to
+# examine whether the remaining incompleteness has a
+# geographic pattern.
+
+ggplot(
+  rainfall_stations_sf
+) +
+  
+  geom_sf(
+    aes(
+      colour = COMPLETENESS
+    ),
+    size = 2
+  ) +
+  
+  scale_colour_viridis_c(
+    option = "viridis",
+    direction = -1,
+    name = "Completeness\n(%)"
+  ) +
+  
+  labs(
+    title = "Completeness of retained rainfall stations",
+    subtitle = "Queensland rainfall stations, 2024",
+    x = "Longitude",
+    y = "Latitude"
+  ) +
+  
+  theme_minimal()
+```
+
+#### 7.6 Compare geographic and projected coordinates
+
+```{r}
+# Extract the coordinates before projection.
+coordinates_geographic <- st_coordinates(
+  rainfall_stations_sf
+)
+
+head(
+  coordinates_geographic
+)
+
+
+# Extract the coordinates after projection.
+coordinates_projected <- st_coordinates(
+  rainfall_stations_3577
+)
+
+head(
+  coordinates_projected
+)
+```
+
+**Interpretation and teaching points.** The original station coordinates are longitude and latitude measured in degrees. After transformation to EPSG:3577, coordinates are expressed in metres. This makes the projected data more appropriate for distance-based interpolation methods such as IDW and kriging. The rainfall map also allows us to visually examine the spatial distribution of both the monitoring stations and annual rainfall before interpolation.
+
+### 8. Prepare The Queensland Boundary And Prediction Grid
+
+#### 8.1 Import the queensland boundary
+
+```{r}
+# Read the Queensland boundary shapefile.
+qld_boundary <- st_read(
+  "QLD area.shp",
+  quiet = TRUE
+)
+
+# Examine the boundary.
+qld_boundary
+
+# Check its coordinate reference system.
+st_crs(qld_boundary)
+```
+
+#### 8.2 Transform to australian albers
+
+```{r}
+# Transform the boundary to EPSG:3577.
+# This uses metres rather than degrees.
+
+qld_boundary_3577 <- st_transform(
+  qld_boundary,
+  crs = 3577
+)
+
+# Repair any invalid polygon geometries.
+qld_boundary_3577 <- st_make_valid(
+  qld_boundary_3577
+)
+
+# Combine all boundary features into one Queensland geometry.
+qld_boundary_3577 <- st_sf(
+  geometry = st_union(qld_boundary_3577)
+)
+
+# Check the projected CRS.
+st_crs(qld_boundary_3577)
+```
+
+#### 8.3 Map queensland and the rainfall stations
+
+```{r}
+ggplot() +
+  
+  geom_sf(
+    data = qld_boundary_3577,
+    fill = "grey95",
+    colour = "grey40",
+    linewidth = 0.4
+  ) +
+  
+  geom_sf(
+    data = rainfall_stations_3577,
+    aes(colour = ANNUAL_RAINFALL),
+    size = 1.8
+  ) +
+  
+  scale_colour_viridis_c(
+    option = "viridis",
+    direction = -1,
+    name = "Annual rainfall\n(mm)"
+  ) +
+  
+  labs(
+    title = "Annual rainfall across Queensland",
+    subtitle = "Weather stations with at least 95% observation-based completeness, 2024"
+  ) +
+  
+  coord_sf(datum = NA) +
+  
+  theme_minimal()
+```
+
+#### 8.4 Create a regular prediction grid
+
+```{r}
+# We create a grid with cells measuring 10 km × 10 km.
+#
+# EPSG:3577 uses metres, so 10 km = 10,000 metres.
+
+grid_size <- 10000
+
+
+# Create a regular grid covering Queensland.
+prediction_grid <- st_make_grid(
+  qld_boundary_3577,
+  cellsize = grid_size,
+  square = TRUE
+)
+
+
+# Convert grid cells into an sf object.
+prediction_grid <- st_sf(
+  geometry = prediction_grid
+)
+```
+
+#### 8.5 Retain grid cells that intersect queensland
+
+```{r}
+# Keep only cells that intersect the Queensland boundary.
+prediction_grid <- st_filter(
+  prediction_grid,
+  qld_boundary_3577
+)
+
+
+# Count the retained grid cells.
+nrow(prediction_grid)
+```
+
+#### 8.6 Create prediction points
+
+```{r}
+# Interpolation methods will estimate rainfall at the
+# centre of each grid cell.
+#
+# st_point_on_surface() creates one point within each cell.
+
+prediction_points <- st_point_on_surface(
+  prediction_grid
+)
+
+
+# Check the number of prediction points.
+nrow(prediction_points)
+```
+
+#### 8.7 Map the prediction grid
+
+```{r}
+ggplot() +
+  
+  geom_sf(
+    data = qld_boundary_3577,
+    fill = "grey95",
+    colour = "grey40",
+    linewidth = 0.4
+  ) +
+  
+  geom_sf(
+    data = prediction_points,
+    colour = "steelblue",
+    size = 0.15,
+    alpha = 0.5
+  ) +
+  
+  geom_sf(
+    data = rainfall_stations_3577,
+    colour = "red",
+    size = 0.6
+  ) +
+  
+  labs(
+    title = "Prediction grid for rainfall interpolation",
+    subtitle = "10 km grid centres across Queensland, EPSG:3577",
+    caption = "Blue: prediction locations | Red: rainfall stations"
+  ) +
+  
+  coord_sf(datum = NA) +
+  
+  theme_minimal()
+```
+
+**Interpretation and teaching points.** We have created a regular grid covering Queensland. Each prediction point represents a location where rainfall will be estimated using nearby weather stations. A 10 km grid provides a consistent spatial resolution for comparing different interpolation methods. The grid resolution does not imply that rainfall was measured or can be reliably estimated at that precision.
+
+### 9. Nearest-Neighbour Interpolation
+
+#### 9.1 Find the nearest rainfall station
+
+```{r}
+# For each prediction point, identify its nearest station.
+nearest_station <- st_nearest_feature(
+  prediction_points,
+  rainfall_stations_3577
+)
+```
+
+#### 9.2 Assign rainfall values
+
+```{r}
+# Assign each prediction point the annual rainfall
+# recorded at its nearest station.
+prediction_points$NN_RAINFALL <-
+  rainfall_stations_3577$ANNUAL_RAINFALL[nearest_station]
+```
+
+#### 9.3 Examine the predicted values
+
+```{r}
+# Summarise the nearest-neighbour rainfall predictions.
+summary(
+  prediction_points$NN_RAINFALL
+)
+```
+
+#### 9.4 Map nearest-neighbour interpolation
+
+```{r}
+ggplot() +
+  
+  geom_sf(
+    data = prediction_points,
+    aes(colour = NN_RAINFALL),
+    size = 0.6
+  ) +
+  
+  geom_sf(
+    data = qld_boundary_3577,
+    fill = NA,
+    colour = "grey30",
+    linewidth = 0.3
+  ) +
+  
+  scale_colour_viridis_c(
+    option = "viridis",
+    direction = -1,
+    name = "Annual rainfall\n(mm)"
+  ) +
+  
+  labs(
+    title = "Nearest-neighbour interpolation of annual rainfall",
+    subtitle = "Queensland, 2024 | 10 km prediction grid"
+  ) +
+  
+  coord_sf(datum = NA) +
+  
+  theme_minimal()
+```
+
+**Interpretation and teaching points.** Each prediction location receives the rainfall value from its closest weather station. This produces abrupt changes between areas assigned to different stations. Unlike IDW and kriging, nearest-neighbour interpolation does not average information from multiple stations.
+
+### 10. Inverse Distance Weighting (IDW)
+
+#### 10.1 Perform IDW interpolation
+
+```{r}
+# Predict annual rainfall at the grid points using IDW.
+#
+# idp = 2 means that weights decrease with squared distance.
+# nmax = 12 means that the 12 nearest stations are used.
+
+idw_result <- gstat::idw(
+  ANNUAL_RAINFALL ~ 1,
+  locations = rainfall_stations_3577,
+  newdata = prediction_points,
+  idp = 2,
+  nmax = 12
+)
+```
+
+#### 10.2 Examine the predicted values
+
+```{r}
+# View the structure of the interpolation result.
+glimpse(idw_result)
+
+# Summarise the predicted rainfall.
+summary(idw_result$var1.pred)
+```
+
+#### 10.3 Map IDW interpolation
+
+```{r}
+ggplot() +
+  
+  geom_sf(
+    data = idw_result,
+    aes(colour = var1.pred),
+    size = 0.6
+  ) +
+  
+  geom_sf(
+    data = qld_boundary_3577,
+    fill = NA,
+    colour = "grey30",
+    linewidth = 0.3
+  ) +
+  
+  scale_colour_viridis_c(
+    option = "viridis",
+    direction = -1,
+    name = "Annual rainfall\n(mm)"
+  ) +
+  
+  labs(
+    title = "IDW interpolation of annual rainfall",
+    subtitle = "Queensland, 2024 | Power = 2"
+  ) +
+  
+  coord_sf(datum = NA) +
+  
+  theme_minimal()
+```
+
+**Interpretation and teaching points.** IDW estimates rainfall using several nearby stations. Stations closer to a prediction location receive greater weights than stations farther away. Compared with nearest-neighbour interpolation, IDW generally produces a smoother rainfall surface. The choice of power parameter affects the result. We will investigate this in the next section.
+
+### 11. Compare Different IDW Power Values
+
+#### 11.1 Run IDW with three power values
+
+```{r}
+# Low power: distant stations have more influence.
+idw_025 <- gstat::idw(
+  ANNUAL_RAINFALL ~ 1,
+  locations = rainfall_stations_3577,
+  newdata = prediction_points,
+  idp = 0.25,
+  nmax = 12
+)
+
+
+# Moderate power: nearby stations have greater influence.
+idw_2 <- gstat::idw(
+  ANNUAL_RAINFALL ~ 1,
+  locations = rainfall_stations_3577,
+  newdata = prediction_points,
+  idp = 2,
+  nmax = 12
+)
+
+
+# High power: the closest stations dominate.
+idw_16 <- gstat::idw(
+  ANNUAL_RAINFALL ~ 1,
+  locations = rainfall_stations_3577,
+  newdata = prediction_points,
+  idp = 16,
+  nmax = 12
+)
+```
+
+#### 11.2 Combine the three results
+
+```{r}
+# Add a label identifying the power used.
+idw_025$POWER <- "Power = 0.25"
+idw_2$POWER   <- "Power = 2"
+idw_16$POWER  <- "Power = 16"
+
+
+# Combine the results into one spatial dataset.
+idw_comparison <- bind_rows(
+  idw_025,
+  idw_2,
+  idw_16
+)
+
+
+# Set the order of the map panels.
+idw_comparison$POWER <- factor(
+  idw_comparison$POWER,
+  levels = c(
+    "Power = 0.25",
+    "Power = 2",
+    "Power = 16"
+  )
+)
+```
+
+#### 11.3 Map the three IDW surfaces
+
+```{r}
+ggplot() +
+  
+  geom_sf(
+    data = idw_comparison,
+    aes(colour = var1.pred),
+    size = 0.5
+  ) +
+  
+  geom_sf(
+    data = qld_boundary_3577,
+    fill = NA,
+    colour = "grey40",
+    linewidth = 0.2
+  ) +
+  
+  facet_wrap(
+    ~ POWER,
+    nrow = 1
+  ) +
+  
+  scale_colour_viridis_c(
+    option = "viridis",
+    direction = -1,
+    name = "Annual rainfall\n(mm)"
+  ) +
+  
+  labs(
+    title = "Effect of IDW power on rainfall interpolation",
+    subtitle = "Queensland, 2024 | 12 nearest stations"
+  ) +
+  
+  coord_sf(datum = NA) +
+  
+  theme_minimal()
+```
+
+**Interpretation and teaching points.** Power = 0.25: Produces a smoother surface because more distant stations contribute relatively greater weights. Power = 2: Produces an intermediate surface with greater influence from nearby stations. Power = 16: Produces sharper spatial transitions because the closest stations dominate the prediction. A higher power does not necessarily mean better accuracy. In the next section, we will use cross-validation to compare prediction accuracy objectively.
+
+### 12. Leave-One-Out Cross-Validation For IDW
+
+#### 12.1 Run cross-validation for three IDW powers
+
+```{r}
+# Power = 0.25
+cv_025 <- gstat::gstat.cv(
+  gstat::gstat(
+    formula = ANNUAL_RAINFALL ~ 1,
+    data = rainfall_stations_3577,
+    nmax = 12,
+    set = list(idp = 0.25)
+  ),
+  nfold = nrow(rainfall_stations_3577)
+)
+
+
+# Power = 2
+cv_2 <- gstat::gstat.cv(
+  gstat::gstat(
+    formula = ANNUAL_RAINFALL ~ 1,
+    data = rainfall_stations_3577,
+    nmax = 12,
+    set = list(idp = 2)
+  ),
+  nfold = nrow(rainfall_stations_3577)
+)
+
+
+# Power = 16
+cv_16 <- gstat::gstat.cv(
+  gstat::gstat(
+    formula = ANNUAL_RAINFALL ~ 1,
+    data = rainfall_stations_3577,
+    nmax = 12,
+    set = list(idp = 16)
+  ),
+  nfold = nrow(rainfall_stations_3577)
+)
+```
+
+#### 12.2 Calculate prediction accuracy
+
+```{r}
+# Define a simple function to calculate RMSE and MAE.
+calculate_accuracy <- function(cv_result, power) {
+  
+  tibble(
+    POWER = power,
+    
+    RMSE = sqrt(
+      mean(cv_result$residual^2, na.rm = TRUE)
+    ),
+    
+    MAE = mean(
+      abs(cv_result$residual),
+      na.rm = TRUE
+    )
+  )
+}
+
+
+# Combine accuracy results.
+cv_results <- bind_rows(
+  calculate_accuracy(cv_025, "0.25"),
+  calculate_accuracy(cv_2, "2"),
+  calculate_accuracy(cv_16, "16")
+)
+
+
+# Display the results.
+cv_results
+```
+
+#### 12.3 Identify the best IDW power
+
+```{r}
+# Rank the methods by RMSE.
+cv_results |>
+  arrange(RMSE)
+```
+
+#### 12.4 Visualise cross-validation results
+
+```{r}
+# Convert the results into long format for plotting.
+cv_plot <- cv_results |>
+  pivot_longer(
+    cols = c(RMSE, MAE),
+    names_to = "METRIC",
+    values_to = "ERROR"
+  )
+
+
+# Compare prediction errors.
+ggplot(
+  cv_plot,
+  aes(
+    x = POWER,
+    y = ERROR,
+    fill = POWER
+  )
+) +
+  
+  geom_col(
+    width = 0.6
+  ) +
+  
+  facet_wrap(
+    ~ METRIC,
+    scales = "free_y"
+  ) +
+  
+  labs(
+    title = "Cross-validation accuracy of IDW interpolation",
+    subtitle = "Leave-one-out cross-validation, Queensland rainfall 2024",
+    x = "IDW power",
+    y = "Prediction error (mm)"
+  ) +
+  
+  theme_minimal() +
+  
+  theme(
+    legend.position = "none"
+  )
+```
+
+**Interpretation and teaching points.** Each station is excluded once and its rainfall is predicted using the remaining stations. RMSE measures overall prediction error and gives greater weight to large errors. MAE measures the average absolute prediction error. The power with the lowest RMSE provides the best cross-validated performance among the values tested. The best power is not necessarily 2.
+
+### 13. Empirical Semivariogram
+
+#### 13.1 Calculate the empirical semivariogram
+
+```{r}
+# Calculate how rainfall differences vary with distance
+# between weather stations.
+rainfall_variogram <- gstat::variogram(
+  ANNUAL_RAINFALL ~ 1,
+  data = rainfall_stations_3577
+)
+
+
+# Examine the first few distance classes.
+head(rainfall_variogram)
+```
+
+#### 13.2 Plot the empirical semivariogram
+
+```{r}
+ggplot(
+  rainfall_variogram,
+  aes(
+    x = dist / 1000,
+    y = gamma
+  )
+) +
+  
+  geom_point(
+    colour = "steelblue",
+    size = 2.5
+  ) +
+  
+  geom_line(
+    colour = "steelblue",
+    linewidth = 0.7
+  ) +
+  
+  labs(
+    title = "Empirical semivariogram of annual rainfall",
+    subtitle = "Queensland weather stations, 2024",
+    x = "Distance between stations (km)",
+    y = "Semivariance (mm²)"
+  ) +
+  
+  theme_minimal()
+```
+
+**Interpretation and teaching points.** Each point represents the average semivariance for pairs of stations separated by a similar distance. A semivariogram that increases with distance suggests that nearby stations tend to have more similar rainfall. The semivariogram helps us understand spatial dependence and provides the basis for fitting a kriging model.
+
+### 14. Fit A Theoretical Semivariogram Model
+
+#### 14.1 Define an initial exponential model
+
+```{r}
+# Specify initial values for:
+# nugget = 200,000 mm²
+# partial sill = 500,000 mm²
+# range parameter = 300 km
+
+initial_model <- gstat::vgm(
+  psill = 500000,
+  model = "Exp",
+  range = 300000,
+  nugget = 200000
+)
+```
+
+#### 14.2 Fit the model to the empirical semivariogram
+
+```{r}
+fitted_model <- gstat::fit.variogram(
+  rainfall_variogram,
+  model = initial_model
+)
+
+
+# Display the fitted parameters.
+fitted_model
+
+
+# Check whether fitting encountered a problem.
+attr(fitted_model, "singular")
+```
+
+#### 14.3 Plot the empirical and fitted semivariogram
+
+```{r}
+plot(
+  rainfall_variogram,
+  fitted_model,
+  main = "Empirical and fitted rainfall semivariogram",
+  xlab = "Distance (m)",
+  ylab = "Semivariance (mm²)"
+)
+```
+
+**Interpretation and teaching points.** The empirical semivariogram shows the observed relationship between distance and rainfall differences. The fitted exponential model provides a mathematical description of that relationship. The nugget represents variability at very short distances. The partial sill describes the additional spatial variance. For an exponential model, the practical range is approximately three times the fitted range parameter. A fitted model should follow the general pattern of the empirical semivariogram.
+
+### 15. Ordinary Kriging
+
+#### 15.1 Perform ordinary kriging
+
+```{r}
+# Predict annual rainfall using the fitted variogram.
+# Use up to 12 nearby stations for each prediction.
+
+kriging_result <- gstat::krige(
+  ANNUAL_RAINFALL ~ 1,
+  locations = rainfall_stations_3577,
+  newdata = prediction_points,
+  model = fitted_model,
+  nmax = 12
+)
+```
+
+#### 15.2 Examine the results
+
+```{r}
+# Summarise predicted rainfall.
+summary(kriging_result$var1.pred)
+
+# Summarise kriging variance.
+summary(kriging_result$var1.var)
+```
+
+#### 15.3 Map kriging predictions
+
+```{r}
+ggplot() +
+  
+  geom_sf(
+    data = kriging_result,
+    aes(colour = var1.pred),
+    size = 0.6
+  ) +
+  
+  geom_sf(
+    data = qld_boundary_3577,
+    fill = NA,
+    colour = "grey30",
+    linewidth = 0.3
+  ) +
+  
+  scale_colour_viridis_c(
+    option = "viridis",
+    direction = -1,
+    name = "Annual rainfall\n(mm)"
+  ) +
+  
+  labs(
+    title = "Ordinary kriging of annual rainfall",
+    subtitle = "Queensland, 2024 | Exponential variogram"
+  ) +
+  
+  coord_sf(datum = NA) +
+  
+  theme_minimal()
+```
+
+#### 15.4 Calculate kriging standard error
+
+```{r}
+# The square root of kriging variance gives
+# the kriging standard error, expressed in mm.
+
+kriging_result$KRIGING_SE <- sqrt(
+  kriging_result$var1.var
+)
+```
+
+#### 15.5 Map kriging uncertainty
+
+```{r}
+ggplot() +
+  
+  geom_sf(
+    data = kriging_result,
+    aes(colour = KRIGING_SE),
+    size = 0.6
+  ) +
+  
+  geom_sf(
+    data = qld_boundary_3577,
+    fill = NA,
+    colour = "grey30",
+    linewidth = 0.3
+  ) +
+  
+  scale_colour_viridis_c(
+    option = "viridis",
+    direction = -1,
+    name = "Standard error\n(mm)"
+  ) +
+  
+  labs(
+    title = "Uncertainty in ordinary kriging predictions",
+    subtitle = "Queensland, 2024 | Kriging standard error"
+  ) +
+  
+  coord_sf(datum = NA) +
+  
+  theme_minimal()
+```
+
+**Interpretation and teaching points.** Ordinary kriging predicts rainfall using the spatial dependence described by the fitted semivariogram. The prediction map shows estimated annual rainfall. The uncertainty map shows the kriging standard error. Larger standard errors indicate greater model-based uncertainty in the predicted rainfall. Kriging uncertainty often increases in areas with fewer nearby monitoring stations.
+
+### 16. Compare Interpolation Methods
+
+#### 16.1 Nearest-neighbour cross-validation
+
+```{r}
+# Calculate distances between all rainfall stations.
+distance_matrix <- st_distance(
+  rainfall_stations_3577
+)
+
+# Exclude each station from being its own nearest neighbour.
+diag(distance_matrix) <- Inf
+
+# Identify the nearest remaining station for each station.
+nearest_cv <- apply(
+  distance_matrix,
+  1,
+  which.min
+)
+
+# Predict rainfall using the nearest remaining station.
+nn_cv_prediction <-
+  rainfall_stations_3577$ANNUAL_RAINFALL[nearest_cv]
+
+# Calculate nearest-neighbour prediction errors.
+nn_residual <-
+  rainfall_stations_3577$ANNUAL_RAINFALL -
+  nn_cv_prediction
+```
+
+#### 16.2 Ordinary kriging cross-validation
+
+```{r}
+# Perform leave-one-out cross-validation using the
+# fitted semivariogram model.
+kriging_cv <- gstat::krige.cv(
+  ANNUAL_RAINFALL ~ 1,
+  locations = rainfall_stations_3577,
+  model = fitted_model,
+  nfold = nrow(rainfall_stations_3577),
+  nmax = 12
+)
+```
+
+#### 16.3 Calculate accuracy for all methods
+
+```{r}
+# Create a function to calculate RMSE and MAE.
+accuracy_metrics <- function(residuals, method) {
+  
+  tibble(
+    METHOD = method,
+    RMSE = sqrt(mean(residuals^2, na.rm = TRUE)),
+    MAE = mean(abs(residuals), na.rm = TRUE)
+  )
+}
+
+
+# Combine cross-validation results.
+method_comparison <- bind_rows(
+  
+  accuracy_metrics(
+    nn_residual,
+    "Nearest neighbour"
+  ),
+  
+  accuracy_metrics(
+    cv_2$residual,
+    "IDW (power = 2)"
+  ),
+  
+  accuracy_metrics(
+    kriging_cv$residual,
+    "Ordinary kriging"
+  )
+  
+)
+
+
+# Display the results, ranked by RMSE.
+method_comparison |>
+  arrange(RMSE)
+```
+
+#### 16.4 Visualise the comparison
+
+```{r}
+# Prepare results for plotting.
+method_plot <- method_comparison |>
+  pivot_longer(
+    cols = c(RMSE, MAE),
+    names_to = "METRIC",
+    values_to = "ERROR"
+  )
+
+
+# Plot RMSE and MAE for each method.
+ggplot(
+  method_plot,
+  aes(
+    x = METHOD,
+    y = ERROR,
+    fill = METHOD
+  )
+) +
+  
+  geom_col(
+    width = 0.6
+  ) +
+  
+  facet_wrap(
+    ~ METRIC,
+    scales = "free_y"
+  ) +
+  
+  labs(
+    title = "Comparison of spatial interpolation methods",
+    subtitle = "Leave-one-out cross-validation, Queensland rainfall 2024",
+    x = "Interpolation method",
+    y = "Prediction error (mm)"
+  ) +
+  
+  theme_minimal() +
+  
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(
+      angle = 25,
+      hjust = 1
+    )
+  )
+```
+
+**Interpretation and teaching points.** All three methods are evaluated using leave-one-out cross-validation. RMSE and MAE are measured in millimetres of annual rainfall. Lower values indicate better predictive accuracy. Cross-validation helps us assess whether the additional complexity of kriging improves prediction accuracy compared with simpler interpolation methods.
+
+## Part B: Spatial smoothing of disease rates
+
+### 17. Import And Explore The Queensland SA2 Data
+
+#### 17.1 Import the spatial data
+
+```{r}
+# Read the Queensland SA2 dataset used in Session 2.
+qld_sa2 <- st_read(
+  "QLD_SA2_Spatial_Epidemiology_Course.gpkg",
+  quiet = TRUE
+)
+
+# Examine the dataset.
+glimpse(qld_sa2)
+
+# Count the SA2 areas.
+nrow(qld_sa2)
+```
+
+#### 17.2 Check the main variables
+
+```{r}
+# POPULATION = population of each SA2.
+# CASES = number of disease cases.
+# CRUDE_RATE = disease rate per 100,000 population.
+
+summary(
+  qld_sa2$POPULATION
+)
+
+summary(
+  qld_sa2$CASES
+)
+
+summary(
+  qld_sa2$CRUDE_RATE
+)
+```
+
+#### 17.3 Examine population size and disease rates
+
+```{r}
+# Plot crude disease rates against population size.
+ggplot(
+  qld_sa2,
+  aes(
+    x = POPULATION,
+    y = CRUDE_RATE
+  )
+) +
+  
+  geom_point(
+    alpha = 0.5,
+    colour = "steelblue"
+  ) +
+  
+  labs(
+    title = "Population size and crude disease rates",
+    subtitle = "Queensland SA2 areas",
+    x = "Population",
+    y = "Crude disease rate per 100,000"
+  ) +
+  
+  theme_minimal()
+```
+
+#### 17.4 Map crude disease rates
+
+```{r}
+ggplot(
+  qld_sa2
+) +
+  
+  geom_sf(
+    aes(
+      fill = CRUDE_RATE
+    ),
+    colour = NA
+  ) +
+  
+  scale_fill_viridis_c(
+    option = "viridis",
+    direction = -1,
+    name = "Crude rate\nper 100,000"
+  ) +
+  
+  labs(
+    title = "Crude disease rates across Queensland",
+    subtitle = "SA2-level disease rates before spatial smoothing"
+  ) +
+  
+  coord_sf(
+    datum = NA
+  ) +
+  
+  theme_minimal()
+```
+
+#### 17.5 Examine the distribution of crude rates
+
+```{r}
+ggplot(
+  qld_sa2,
+  aes(
+    x = CRUDE_RATE
+  )
+) +
+  
+  geom_histogram(
+    bins = 30,
+    fill = "steelblue",
+    colour = "white"
+  ) +
+  
+  labs(
+    title = "Distribution of crude disease rates",
+    subtitle = "Queensland SA2 areas",
+    x = "Crude disease rate per 100,000",
+    y = "Number of SA2 areas"
+  ) +
+  
+  theme_minimal()
+```
+
+#### 17.6 Identify areas with small populations
+
+```{r}
+# Display the 10 SA2 areas with the smallest populations.
+qld_sa2 |>
+  
+  st_drop_geometry() |>
+  
+  arrange(
+    POPULATION
+  ) |>
+  
+  select(
+    POPULATION,
+    CASES,
+    CRUDE_RATE
+  ) |>
+  
+  slice_head(
+    n = 10
+  )
+```
+
+**Interpretation and teaching points.** Crude disease rates are calculated using the number of cases and the population at risk. Areas with small populations can have unstable rates because a small change in case numbers may produce a large change in the calculated rate. This can make some areas appear to have unusually high or low disease rates because of random variation. Spatial smoothing aims to reduce this instability and reveal broader underlying geographic patterns. However, smoothing can also obscure genuine local variation, so both crude and smoothed rates should be considered when interpreting results.
+
+### 18. Empirical Bayes Smoothing
+
+#### 18.1 Calculate the overall disease rate
+
+```{r}
+# Calculate the population-weighted Queensland rate.
+overall_rate <- sum(qld_sa2$CASES) /
+  sum(qld_sa2$POPULATION) * 100000
+
+overall_rate
+```
+
+#### 18.2 Apply empirical bayes smoothing
+
+```{r}
+# Load the spdep package.
+library(spdep)
+
+# Calculate global empirical Bayes estimates.
+eb_result <- EBest(
+  qld_sa2$CASES,
+  qld_sa2$POPULATION
+)
+
+# Add smoothed rates to the dataset.
+# EB estimates are rates per person, so multiply by 100,000.
+qld_sa2$EB_RATE <- eb_result$est * 100000
+```
+
+#### 18.3 Compare crude and smoothed rates
+
+```{r}
+summary(qld_sa2$CRUDE_RATE)
+
+summary(qld_sa2$EB_RATE)
+```
+
+#### 18.4 Map crude and smoothed rates
+
+```{r}
+# Prepare the data for a side-by-side comparison.
+rate_comparison <- qld_sa2 |>
+  select(CRUDE_RATE, EB_RATE) |>
+  pivot_longer(
+    cols = c(CRUDE_RATE, EB_RATE),
+    names_to = "METHOD",
+    values_to = "RATE"
+  )
+
+# Give the methods clear labels.
+rate_comparison$METHOD <- factor(
+  rate_comparison$METHOD,
+  levels = c("CRUDE_RATE", "EB_RATE"),
+  labels = c("Crude rates", "Empirical Bayes rates")
+)
+
+# Plot both maps using the same colour scale.
+ggplot(rate_comparison) +
+  
+  geom_sf(
+    aes(fill = RATE),
+    colour = NA
+  ) +
+  
+  facet_wrap(~ METHOD, nrow = 1) +
+  
+  scale_fill_viridis_c(
+    option = "viridis",
+    direction = -1,
+    name = "Disease rate\nper 100,000"
+  ) +
+  
+  labs(
+    title = "Crude versus empirical Bayes disease rates",
+    subtitle = "Queensland SA2 areas"
+  ) +
+  
+  coord_sf(datum = NA) +
+  
+  theme_minimal()
+```
+
+#### 18.5 Examine the amount of smoothing
+
+```{r}
+# Calculate the change after smoothing.
+qld_sa2$RATE_CHANGE <- qld_sa2$EB_RATE -
+  qld_sa2$CRUDE_RATE
+
+# Plot crude versus smoothed rates.
+ggplot(
+  qld_sa2,
+  aes(
+    x = CRUDE_RATE,
+    y = EB_RATE
+  )
+) +
+  
+  geom_point(
+    aes(size = POPULATION),
+    alpha = 0.5,
+    colour = "steelblue"
+  ) +
+  
+  geom_abline(
+    slope = 1,
+    intercept = 0,
+    linetype = "dashed",
+    colour = "red"
+  ) +
+  
+  labs(
+    title = "Crude versus smoothed disease rates",
+    subtitle = "Point size represents SA2 population",
+    x = "Crude rate per 100,000",
+    y = "Empirical Bayes rate per 100,000",
+    size = "Population"
+  ) +
+  
+  theme_minimal()
+```
+
+**Interpretation and teaching points.** Empirical Bayes smoothing reduces the influence of random variation in disease rates. Areas with smaller populations generally experience greater adjustment towards the overall disease rate. Areas with larger populations generally retain rates closer to their original crude estimates. This method does not use neighbouring SA2 information. Smoothed rates can be useful for identifying broad geographic patterns, but they may conceal genuine local differences in disease risk.
+
+### 19. Spatial Smoothing Using Neighbouring SA2 Areas
+
+#### 19.1 Identify neighbouring SA2 areas
+
+```{r}
+# Use Queen contiguity:
+# SA2s are neighbours if they share a boundary or corner.
+
+sa2_neighbours <- spdep::poly2nb(
+  qld_sa2,
+  queen = TRUE
+)
+
+# Examine the number of neighbours.
+summary(
+  spdep::card(sa2_neighbours)
+)
+```
+
+#### 19.2 Calculate neighbourhood-pooled rates
+
+```{r}
+# For each SA2, combine its own cases and population
+# with those of its neighbouring SA2s.
+
+qld_sa2$SPATIAL_RATE <- sapply(
+  seq_len(nrow(qld_sa2)),
+  function(i) {
+    
+    # Include the current SA2 and its neighbours.
+    nearby <- c(i, sa2_neighbours[[i]])
+    
+    # Calculate the pooled disease rate.
+    sum(qld_sa2$CASES[nearby]) /
+      sum(qld_sa2$POPULATION[nearby]) * 100000
+  }
+)
+```
+
+#### 19.3 Summarise the three types of rates
+
+```{r}
+summary(
+  qld_sa2[, c(
+    "CRUDE_RATE",
+    "EB_RATE",
+    "SPATIAL_RATE"
+  )] |>
+    st_drop_geometry()
+)
+```
+
+#### 19.4 Compare the three maps
+
+```{r}
+#| fig-width: 13
+#| fig-height: 6
+# Prepare the data for plotting.
+three_rate_maps <- qld_sa2 |>
+  
+  select(
+    CRUDE_RATE,
+    EB_RATE,
+    SPATIAL_RATE
+  ) |>
+  
+  pivot_longer(
+    cols = c(CRUDE_RATE, EB_RATE, SPATIAL_RATE),
+    names_to = "METHOD",
+    values_to = "RATE"
+  )
+
+
+# Give the maps readable labels.
+three_rate_maps$METHOD <- factor(
+  three_rate_maps$METHOD,
+  
+  levels = c(
+    "CRUDE_RATE",
+    "EB_RATE",
+    "SPATIAL_RATE"
+  ),
+  
+  labels = c(
+    "Crude rates",
+    "Global empirical Bayes",
+    "Neighbourhood smoothing"
+  )
+)
+
+
+# Display all three maps using the same colour scale.
+ggplot(three_rate_maps) +
+  
+  geom_sf(
+    aes(fill = RATE),
+    colour = NA
+  ) +
+  
+  facet_wrap(
+    ~ METHOD,
+    nrow = 1
+  ) +
+  
+  scale_fill_viridis_c(
+    option = "viridis",
+    direction = -1,
+    name = "Disease rate\nper 100,000"
+  ) +
+  
+  labs(
+    title = "Comparison of disease-rate smoothing methods",
+    subtitle = "Queensland SA2 areas"
+  ) +
+  
+  coord_sf(datum = NA) +
+  
+  theme_minimal()
+```
+
+**Interpretation and teaching points.** Crude rates use the cases and population of each SA2. Global empirical Bayes smoothing adjusts rates towards the overall Queensland rate. Neighbourhood smoothing combines cases and populations from each SA2 and its geographically adjacent areas. The neighbourhood-pooled rate reflects nearby disease patterns but may blur genuine local differences. SA2s with no neighbours retain their own crude rate. These approaches demonstrate different ways of reducing variability in small-area disease rates.
+
+## Part C: Kernel density estimation (KDE)
+
+### 20. Prepare Point Data For KDE
+
+#### 20.1 Load the required package
+
+```{r}
+# MASS provides functions for kernel density estimation.
+library(MASS)
+```
+
+#### 20.2 Transform the SA2 data
+
+```{r}
+# Transform Queensland SA2 polygons to EPSG:3577.
+# This projected coordinate system uses metres.
+
+qld_sa2_3577 <- st_transform(
+  qld_sa2,
+  3577
+)
+```
+
+#### 20.3 Create representative points
+
+```{r}
+# Create one representative point inside each SA2 polygon.
+# These points are NOT actual disease-case locations.
+
+kde_points <- st_point_on_surface(
+  qld_sa2_3577
+)
+```
+
+#### 20.4 Explore the point data
+
+```{r}
+# Count the representative points.
+nrow(kde_points)
+
+# Summarise disease-case counts.
+summary(kde_points$CASES)
+
+# Check the coordinate reference system.
+st_crs(kde_points)
+```
+
+#### 20.5 Map the representative points
+
+```{r}
+ggplot() +
+  
+  # Display the Queensland SA2 polygons.
+  geom_sf(
+    data = qld_sa2_3577,
+    fill = "grey95",
+    colour = "grey80",
+    linewidth = 0.1
+  ) +
+  
+  # Add representative points.
+  # Larger circles represent more reported cases.
+  geom_sf(
+    data = kde_points,
+    aes(size = CASES),
+    colour = "steelblue",
+    alpha = 0.6
+  ) +
+  
+  scale_size_continuous(
+    name = "Disease cases"
+  ) +
+  
+  labs(
+    title = "Representative locations of disease cases",
+    subtitle = "Queensland SA2 areas | Point size represents case count"
+  ) +
+  
+  coord_sf(datum = NA) +
+  
+  theme_minimal()
+```
+
+**Interpretation and teaching points.** **1.** KDE is a spatial smoothing method, not a conventional spatial interpolation method like IDW.
+
+### 2. KDE Estimates The Spatial Concentration Of Point Events.
+
+### 3. Each Point In This Example Represents An SA2 Area,
+
+```{r}
+#    not an individual disease case.
+#
+```
+
+### 4. The Size Of Each Point Indicates The Number Of Cases
+
+```{r}
+#    reported within that SA2.
+#
+```
+
+### 5. We Will Use These Counts As Weights When Calculating
+
+```{r}
+#    the KDE surface in the next section.
+#
+```
+
+### 6. Representative Points Simplify The True Distribution
+
+```{r}
+#    of cases within each SA2.
+#
+```
+
+### 7. KDE Based On These Points Is Influenced By SA2 Size,
+
+```{r}
+#    shape, and the placement of representative points.
+#
+```
+
+### 8. A High Concentration Of Cases Does Not Necessarily
+
+```{r}
+#    indicate high disease risk because population
+#    distribution also affects case counts.
+#
+```
+
+### 21. KDE With Different Bandwidths
+
+#### 21.1 Load required packages
+
+```{r}
+kde_packages <- c("spatstat.geom", "spatstat.explore")
+
+new_packages <- kde_packages[
+  !kde_packages %in% installed.packages()[, "Package"]
+]
+
+if (length(new_packages) > 0) {
+  install.packages(new_packages)
+}
+
+library(spatstat.geom)
+library(spatstat.explore)
+```
+
+#### 21.2 Prepare the point pattern
+
+```{r}
+# Extract projected coordinates (metres).
+kde_coords <- st_coordinates(kde_points)
+
+# Obtain Queensland's bounding box.
+qld_bbox <- st_bbox(qld_sa2_3577)
+
+# Create a rectangular analysis window.
+kde_window <- spatstat.geom::owin(
+  xrange = c(qld_bbox["xmin"], qld_bbox["xmax"]),
+  yrange = c(qld_bbox["ymin"], qld_bbox["ymax"])
+)
+
+# Create a spatial point pattern.
+# Case counts will be used as KDE weights.
+kde_pattern <- spatstat.geom::ppp(
+  x = kde_coords[, 1],
+  y = kde_coords[, 2],
+  window = kde_window,
+  marks = kde_points$CASES,
+  checkdup = FALSE
+)
+```
+
+#### 21.3 Calculate KDE with three bandwidths
+
+```{r}
+# Small bandwidth: more local detail.
+kde_25 <- spatstat.explore::density.ppp(
+  kde_pattern,
+  sigma = 25000,
+  weights = kde_points$CASES,
+  edge = TRUE,
+  dimyx = 350
+)
+
+# Medium bandwidth: moderate smoothing.
+kde_50 <- spatstat.explore::density.ppp(
+  kde_pattern,
+  sigma = 50000,
+  weights = kde_points$CASES,
+  edge = TRUE,
+  dimyx = 350
+)
+
+# Large bandwidth: broader smoothing.
+kde_100 <- spatstat.explore::density.ppp(
+  kde_pattern,
+  sigma = 100000,
+  weights = kde_points$CASES,
+  edge = TRUE,
+  dimyx = 350
+)
+```
+
+#### 21.4 Convert KDE surfaces to data frames
+
+```{r}
+kde_to_df <- function(kde_surface, bandwidth_label) {
+  
+  kde_df <- as.data.frame(
+    kde_surface,
+    xy = TRUE
+  )
+  
+  names(kde_df) <- c("x", "y", "DENSITY")
+  
+  kde_df$BANDWIDTH <- bandwidth_label
+  
+  return(kde_df)
+}
+
+kde_maps <- bind_rows(
+  kde_to_df(kde_25, "25 km"),
+  kde_to_df(kde_50, "50 km"),
+  kde_to_df(kde_100, "100 km")
+)
+
+kde_maps$BANDWIDTH <- factor(
+  kde_maps$BANDWIDTH,
+  levels = c("25 km", "50 km", "100 km")
+)
+```
+
+#### 21.5 Mask KDE surfaces to queensland
+
+```{r}
+# Combine SA2 polygons into a Queensland study-area boundary.
+qld_kde_boundary <- st_union(qld_sa2_3577)
+
+# Create spatial points at KDE grid-cell centres.
+kde_grid_points <- st_as_sf(
+  kde_maps,
+  coords = c("x", "y"),
+  crs = 3577,
+  remove = FALSE
+)
+
+# Keep only grid cells whose centres fall inside Queensland.
+inside_qld <- lengths(
+  st_intersects(
+    kde_grid_points,
+    qld_kde_boundary
+  )
+) > 0
+
+# Set density outside Queensland to NA.
+kde_maps$DENSITY[!inside_qld] <- NA
+```
+
+#### 21.6 Prepare colours for the KDE maps
+
+```{r}
+# KDE values are continuous and often strongly skewed.
+# A square-root transformation helps reveal lower densities
+# while keeping the same colour scale across all panels.
+
+# Set a small display threshold.
+# Very small densities will be shown as white.
+# This is for visualisation only; the KDE is unchanged.
+
+density_threshold <- max(
+  kde_maps$DENSITY,
+  na.rm = TRUE
+) * 0.001
+
+# Create a display variable.
+kde_maps$DISPLAY_DENSITY <- kde_maps$DENSITY
+
+# Show zero and near-zero density values in white.
+kde_maps$DISPLAY_DENSITY[
+  !is.na(kde_maps$DISPLAY_DENSITY) &
+    kde_maps$DISPLAY_DENSITY <= density_threshold
+] <- NA
+```
+
+#### 21.7 Map the three KDE surfaces
+
+```{r}
+ggplot() +
+  
+  # Draw the KDE surface.
+  geom_raster(
+    data = kde_maps,
+    aes(
+      x = x,
+      y = y,
+      fill = DISPLAY_DENSITY
+    )
+  ) +
+  
+  # Add the Queensland boundary.
+  geom_sf(
+    data = qld_kde_boundary,
+    fill = NA,
+    colour = "grey40",
+    linewidth = 0.3
+  ) +
+  
+  # Compare bandwidths.
+  facet_wrap(
+    ~ BANDWIDTH,
+    nrow = 1
+  ) +
+  
+  # White for zero/near-zero density.
+  # Square-root transformation improves visibility.
+  scale_fill_viridis_c(
+    option = "inferno",
+    trans = "sqrt",
+    na.value = "white",
+    name = "Case density
+(cases/m²)"
+  ) +
+  
+  labs(
+    title = "Kernel density estimation of disease cases",
+    subtitle = "Effect of bandwidth: 25, 50 and 100 km",
+    x = NULL,
+    y = NULL
+  ) +
+  
+  coord_sf(
+    datum = NA,
+    expand = FALSE
+  ) +
+  
+  theme_minimal() +
+  
+  theme(
+    panel.grid = element_blank(),
+    strip.text = element_text(face = "bold"),
+    plot.title = element_text(face = "bold"),
+    legend.position = "right"
+  )
+```
+
+**Interpretation and teaching points.** **1.** KDE estimates the spatial concentration of point events.
+
+### 2. The Number Of Disease Cases Is Used As A Weight
+
+```{r}
+#    for each SA2 representative point.
+#
+```
+
+### 3. A Gaussian Kernel Is Used For All Three Surfaces.
+
+### 4. Bandwidth Determines The Degree Of Smoothing.
+
+### 5. A 25 Km Bandwidth Produces More Localised Patterns.
+
+### 6. A 50 Km Bandwidth Produces Intermediate Smoothing.
+
+### 7. A 100 Km Bandwidth Produces Broader Patterns.
+
+### 8. All Three Maps Use The Same Colour Scale.
+
+### 9. A Square-Root Colour Transformation Helps Reveal
+
+```{r}
+#    areas with relatively low case density.
+#
+```
+
+### 10. White Areas Outside Queensland Are Excluded
+
+```{r}
+#     from the analysis display.
+#
+```
+
+### 11. White Areas Inside Queensland Indicate Zero Or
+
+```{r}
+#     very low displayed density values.
+#
+```
+
+### 12. The Near-Zero Threshold Is Only A Display Choice.
+
+```{r}
+#     It does not modify the calculated KDE estimates.
+#
+```
+
+### 13. KDE Based On SA2 Representative Points Is An
+
+```{r}
+#     approximation, not individual-level case KDE.
+#
+```
+
+### 14. Case Density Is Not Equivalent To Disease Risk.
+
+### 15. KDE Edge Effects Can Influence Estimates Near
+
+```{r}
+#     the study-area boundary. Here, edge correction
+#     uses the rectangular calculation window, while
+#     Queensland masking is applied only for display.
+#
+```
+
+## Summary: Choosing the right method
+
+| Approach | Input | Main output | Key choice | What it does **not** establish |
+|---|---|---|---|---|
+| Nearest neighbour | Stations with measured rainfall | Value of closest station | Distance and station coverage | Smooth spatial variation |
+| IDW | Stations with measured rainfall | Weighted rainfall predictions | Distance-decay power, number of neighbours | A statistical uncertainty model |
+| Ordinary kriging | Stations with measured rainfall | Predictions and model-based standard errors | Variogram model and neighbourhood | Guaranteed superiority to IDW |
+| Global empirical Bayes | Area cases and population | Stabilised rates per 100,000 | Global pooling model | Explicit geographic neighbour effects |
+| Neighbourhood-pooled rates | Area cases, population, adjacency | Rates pooled over each area and its neighbours | Definition of neighbours | A formal Bayesian posterior estimate |
+| Weighted KDE | Point locations with case-count weights | Smoothed case intensity | Kernel and bandwidth | Population-adjusted disease risk |
+
+### What we observed in the Queensland examples
+
+**Rainfall interpolation.** Among the IDW powers tested (0.25, 2 and 16), **power 2 gave the lowest cross-validation errors**. In the three-method comparison, IDW (power 2) also outperformed nearest neighbour and the fitted ordinary kriging model in this exercise. This is a result for these data, model choices and validation design, not a universal ranking of methods. The empirical semivariogram increased with separation distance and did not show a convincing plateau across the displayed distances; a single stationary exponential model is therefore a simplification for Queensland-wide rainfall.
+
+**Kriging uncertainty.** Kriging standard errors quantify uncertainty under the fitted variogram and ordinary-kriging assumptions. They are not observed prediction errors. Areas with sparse stations or unusual station geometry may have greater model-based uncertainty.
+
+**SA2 smoothing.** The crude map showed more local variation. Global empirical Bayes moderated extreme rates by shrinking them toward the statewide rate, with stronger adjustment generally occurring in less populous areas. Neighbourhood pooling produced a visibly smoother map because each SA2 was combined with adjacent areas. Smoothing can also hide real local differences; compare smoothed and crude rates together. In this exercise, areas without polygon neighbours retain their own rate.
+
+**KDE.** At **25 km**, the weighted KDE shows separated local peaks; at **50 km**, nearby peaks merge; at **100 km**, the surface becomes broader and smoother. The strongest displayed concentration was in southeastern Queensland. These surfaces use **one representative point per SA2 weighted by its case count**: they are *not* individual case locations. Case intensity is not disease risk because the population at risk is not included in the denominator.
+
+### KDE display, units and boundaries
+
+The KDE computation uses projected coordinates in **metres**, so its raw intensity is in **weighted cases per square metre**. For example, multiply a raw density value by **100,000,000** to express it as weighted cases per **100 km²**; this is a change of units, not a risk adjustment. The maps use a common square-root-transformed colour scale to reveal lower intensities. White areas *inside* Queensland indicate values below a **visualisation threshold** (0.1% of the maximum displayed density), not necessarily exactly zero. White outside Queensland is the map mask. The `edge = TRUE` correction refers to the **rectangular calculation window**, not the Queensland boundary; masking after KDE does not itself correct for geographic edge effects.
+
+### Additional concepts from the lecture
+
+**Nugget, sill and range:** the nugget describes very short-distance variability or measurement error; the sill is the semivariance plateau, if present; and the range is the distance beyond which correlation becomes weak. For an exponential variogram, the practical range is approximately three times its fitted range parameter. A variogram that keeps rising over the plotted distances suggests the sill may not be identifiable within that distance range.
+
+**Ordinary versus universal kriging:** ordinary kriging assumes an unknown but locally constant mean, whereas universal kriging models a systematic spatial trend using coordinates or explanatory covariates. Universal kriging is discussed conceptually here rather than implemented; it can be relevant when rainfall has strong regional gradients.
+
+**Kernel and bandwidth:** a Gaussian kernel gives each point a smooth influence that decays with distance. Bandwidth determines the scale of smoothing and generally affects the result more visibly than changing between common smooth kernel shapes. The 25, 50 and 100 km bandwidths are illustrative rather than optimised.
+
+**Validation matters:** leave-one-out cross-validation tests how well a method predicts held-out station observations. RMSE penalises large errors more heavily than MAE. Where there is strong spatial dependence, spatially blocked validation can be a useful stricter assessment of geographic generalisation.
+
+### Reflection questions
+
+1. Why might IDW outperform kriging even though kriging has a statistical model?
+2. How would increasing IDW power change the map, and why does that not guarantee better accuracy?
+3. Why might a small-population SA2 have a highly unstable crude rate?
+4. What information is lost when neighbourhood smoothing is applied?
+5. Why can a high KDE case concentration coexist with an ordinary or low population-adjusted disease rate?
+6. What would change if the KDE were based on individual geocoded cases instead of SA2 representative points?
+
+---
+
+*End of Session 3. Keep the data in the `data/` folder and render this file as `index.qmd` for a GitHub Pages-compatible HTML page.*
