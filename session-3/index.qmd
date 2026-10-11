@@ -1077,7 +1077,17 @@ ggplot(
   theme_minimal()
 ```
 
-**Interpretation and teaching points.** Each point represents the average semivariance for pairs of stations separated by a similar distance. A semivariogram that increases with distance suggests that nearby stations tend to have more similar rainfall. The semivariogram helps us understand spatial dependence and provides the basis for fitting a kriging model.
+**Interpretation and teaching points.** The empirical semivariogram shows how rainfall differences between monitoring stations change as the distance between them increases. In general, stations closer together have more similar annual rainfall, while stations farther apart tend to have greater differences.
+
+We can observe three main patterns:
+
+- **Approximately 35–150 km:** Rainfall differences increase as the distance between stations increases. This suggests that nearby stations tend to have more similar rainfall.
+- **Approximately 150–500 km:** Rainfall differences increase more slowly and fluctuate. This creates a partial plateau, but it does not mean that the semivariogram has reached a stable sill.
+- **Approximately 500–830 km:** Rainfall differences increase substantially again, suggesting greater variation between stations that are far apart.
+
+**An important observation:** The semivariogram does not reach a clear overall sill (a level where rainfall differences stop increasing with distance). One possible explanation is **spatial drift**, meaning that average rainfall changes gradually across Queensland rather than remaining constant throughout the study area. Other explanations, including long-distance spatial dependence and the distribution of station pairs, may also contribute.
+
+This matters for ordinary kriging because the method assumes a constant but unknown mean within the modelled area. If a broad geographical rainfall trend exists, this assumption may not be appropriate. Further investigation using trend-adjusted or directional semivariograms could help determine whether a different modelling approach is needed.
 
 ### 13. Fit A Theoretical Semivariogram Model
 

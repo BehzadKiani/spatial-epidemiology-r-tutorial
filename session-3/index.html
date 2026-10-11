@@ -4939,7 +4939,15 @@ $ geometry  &lt;POINT [m]&gt; POINT (1848220 -3307388), POINT (1858220 -3307388)
 </div>
 </div>
 </div>
-<p><strong>Interpretation and teaching points.</strong> Each point represents the average semivariance for pairs of stations separated by a similar distance. A semivariogram that increases with distance suggests that nearby stations tend to have more similar rainfall. The semivariogram helps us understand spatial dependence and provides the basis for fitting a kriging model.</p>
+<p><strong>Interpretation and teaching points.</strong> The empirical semivariogram shows how rainfall differences between monitoring stations change as the distance between them increases. In general, stations closer together have more similar annual rainfall, while stations farther apart tend to have greater differences.</p>
+<p>We can observe three main patterns:</p>
+<ul>
+<li><strong>Approximately 35–150 km:</strong> Rainfall differences increase as the distance between stations increases. This suggests that nearby stations tend to have more similar rainfall.</li>
+<li><strong>Approximately 150–500 km:</strong> Rainfall differences increase more slowly and fluctuate. This creates a partial plateau, but it does not mean that the semivariogram has reached a stable sill.</li>
+<li><strong>Approximately 500–830 km:</strong> Rainfall differences increase substantially again, suggesting greater variation between stations that are far apart.</li>
+</ul>
+<p><strong>An important observation:</strong> The semivariogram does not reach a clear overall sill (a level where rainfall differences stop increasing with distance). One possible explanation is <strong>spatial drift</strong>, meaning that average rainfall changes gradually across Queensland rather than remaining constant throughout the study area. Other explanations, including long-distance spatial dependence and the distribution of station pairs, may also contribute.</p>
+<p>This matters for ordinary kriging because the method assumes a constant but unknown mean within the modelled area. If a broad geographical rainfall trend exists, this assumption may not be appropriate. Further investigation using trend-adjusted or directional semivariograms could help determine whether a different modelling approach is needed.</p>
 </section>
 </section>
 <section id="fit-a-theoretical-semivariogram-model" class="level3">
