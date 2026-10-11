@@ -32,11 +32,11 @@ By the end of this tutorial, you should be able to prepare spatial data in a pro
 
 Download the following datasets before running the practical exercises:
 
-- **[Queensland daily rainfall data, 2024 (CSV)](QLD_SILO_Daily_Rainfall_2024_raw.csv)** — daily rainfall records used in Part A.
+- **[Queensland daily rainfall data, 2024 (ZIP)](QLD_SILO_Daily_Rainfall_2024_raw.zip)** — compressed daily rainfall records used in Part A. Download and extract the ZIP file before running the exercises.
 - **[Queensland boundary shapefile (ZIP)](QLD%20area.zip)** — download and extract the ZIP file before running Part A.
 - **[Queensland SA2 spatial epidemiology dataset (GeoPackage)](QLD_SA2_Spatial_Epidemiology_Course.gpkg)** — population, disease cases, and crude rates used in Parts B and C.
 
-Download all three datasets and place the extracted files in the same folder as `index.qmd` before running the exercises in order. The shapefile ZIP should contain its `.shp`, `.shx`, `.dbf`, and `.prj` components. For GitHub Pages, each download link must point to an accessible hosted file. Large files may need to be hosted outside the GitHub repository; update the links above to their actual public download URLs. `embed-resources: true` embeds page assets such as figures, but does not embed these downloadable datasets.
+Download all three datasets before running the practical exercises. Extract the Queensland boundary shapefile ZIP and place its components (.shp, .shx, .dbf, and .prj) in the same folder as index.html. The rainfall ZIP file can be placed in the same folder without manually extracting it, as the R code below will automatically unzip it. Place the SA2 GeoPackage in the same folder. For GitHub Pages, each download link must point to an accessible hosted file. embed-resources: true embeds page assets such as figures, but does not embed these downloadable datasets.
 
 **Data interpretation:** Some annual rainfall totals include a small number of SILO-filled days, even after the 95% observation-based completeness filter. The SA2 dataset contains aggregated case counts, not individual case locations.
 
@@ -56,13 +56,36 @@ library(gstat)
 ### 2. Import The Queensland Rainfall Data
 
 ```{r}
+# Download and extract the Queensland rainfall dataset.
+
+# Define the ZIP and CSV filenames.
+zip_file <- "QLD_SILO_Daily_Rainfall_2024_raw.zip"
+csv_file <- "QLD_SILO_Daily_Rainfall_2024_raw.csv"
+
+# Download the ZIP file from GitHub if it is not available.
+if (!file.exists(zip_file) && !file.exists(csv_file)) {
+  download.file(
+    "https://raw.githubusercontent.com/BehzadKiani/spatial-epidemiology-r-tutorial/main/session-3/QLD_SILO_Daily_Rainfall_2024_raw.zip",
+    destfile = zip_file,
+    mode = "wb"
+  )
+}
+
+# Extract the CSV file if it does not already exist.
+if (!file.exists(csv_file)) {
+  unzip(
+    zip_file,
+    files = csv_file,
+    exdir = "."
+  )
+}
+
 # Read daily rainfall data for Queensland weather stations
 # during 2024.
 rainfall_daily <- read_csv(
-  "QLD_SILO_Daily_Rainfall_2024_raw.csv",
+  csv_file,
   show_col_types = FALSE
 )
-
 
 # Examine the structure of the dataset.
 glimpse(rainfall_daily)
@@ -1137,33 +1160,43 @@ summary(kriging_result$var1.var)
 
 ```{r}
 ggplot() +
-  
+
   geom_sf(
     data = kriging_result,
     aes(colour = var1.pred),
     size = 0.6
   ) +
-  
+
   geom_sf(
     data = qld_boundary_3577,
     fill = NA,
     colour = "grey30",
     linewidth = 0.3
   ) +
-  
+
+  # Overlay rainfall monitoring stations.
+  geom_sf(
+    data = rainfall_stations_3577,
+    shape = 21,
+    fill = "black",
+    colour = "white",
+    size = 1.5,
+    stroke = 0.3
+  ) +
+
   scale_colour_viridis_c(
     option = "viridis",
     direction = -1,
     name = "Annual rainfall\n(mm)"
   ) +
-  
+
   labs(
     title = "Ordinary kriging of annual rainfall",
     subtitle = "Queensland, 2024 | Exponential variogram"
   ) +
-  
+
   coord_sf(datum = NA) +
-  
+
   theme_minimal()
 ```
 
@@ -1182,37 +1215,47 @@ kriging_result$KRIGING_SE <- sqrt(
 
 ```{r}
 ggplot() +
-  
+
   geom_sf(
     data = kriging_result,
     aes(colour = KRIGING_SE),
     size = 0.6
   ) +
-  
+
   geom_sf(
     data = qld_boundary_3577,
     fill = NA,
     colour = "grey30",
     linewidth = 0.3
   ) +
-  
+
+  # Overlay rainfall monitoring stations.
+  geom_sf(
+    data = rainfall_stations_3577,
+    shape = 21,
+    fill = "black",
+    colour = "white",
+    size = 1.5,
+    stroke = 0.3
+  ) +
+
   scale_colour_viridis_c(
     option = "viridis",
     direction = -1,
     name = "Standard error\n(mm)"
   ) +
-  
+
   labs(
     title = "Uncertainty in ordinary kriging predictions",
     subtitle = "Queensland, 2024 | Kriging standard error"
   ) +
-  
+
   coord_sf(datum = NA) +
-  
+
   theme_minimal()
 ```
 
-**Interpretation and teaching points.** Ordinary kriging predicts rainfall using the spatial dependence described by the fitted semivariogram. The prediction map shows estimated annual rainfall. The uncertainty map shows the kriging standard error. Larger standard errors indicate greater model-based uncertainty in the predicted rainfall. Kriging uncertainty often increases in areas with fewer nearby monitoring stations.
+**Interpretation and teaching points.** Ordinary kriging predicts rainfall using the spatial dependence described by the fitted semivariogram. The prediction map shows estimated annual rainfall. The uncertainty map shows the kriging standard error. Larger standard errors indicate greater model-based uncertainty in the predicted rainfall. Kriging uncertainty often increases in areas with fewer nearby monitoring stations. The black circles represent the rainfall monitoring stations used for interpolation. Comparing their distribution with the kriging standard error map helps identify areas where predictions are less certain because monitoring stations are sparse.
 
 ### 15. Compare Interpolation Methods
 
