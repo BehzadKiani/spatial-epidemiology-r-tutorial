@@ -41,11 +41,14 @@ This practical is adapted from an Oxford teaching exercise developed by **Profes
 
 # Section 1: Getting started
 
-The following setup checks whether packages are installed and installs only missing ones. **INLA is installed from its official repository**, rather than CRAN. On subsequent renders, installed packages are simply loaded. If your teaching environment already has the packages, no installation is performed. Installation requires internet access only when a package is missing. The setup chunk is hidden from the rendered teaching handout, but remains available in the editable QMD.
+The following code checks whether the required R packages are already installed and installs only those that are missing. **R-INLA is installed from its official repository rather than CRAN.** Students can run this code when setting up their R environment for the first time. Once the packages are installed, they will simply be loaded in subsequent sessions.
 
 ```{r}
 #| label: setup-packages
-#| include: false
+#| echo: true
+#| output: false
+#| warning: false
+#| message: false
 # Set the CRAN repository
 options(repos = c(CRAN = "https://cloud.r-project.org"))
 
