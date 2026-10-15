@@ -1,0 +1,1528 @@
+---
+title: "Session 4 | Bayesian Spatial Disease Mapping in R"
+subtitle: "Queensland SA2 practical: Poisson, IID, BYM2, exceedance probabilities and uncertainty"
+author: "Spatial Epidemiology Course"
+date: "2026-10-15"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: false
+    code-fold: false
+    code-copy: true
+    theme: cosmo
+    embed-resources: true
+execute:
+  echo: true
+  warning: false
+  message: false
+  error: false
+  cache: false
+  output: true
+---
+
+## About this practical
+
+This practical is adapted from an Oxford teaching exercise developed by **Professor Benn Sartorius**, and uses the supplied Queensland SA2 spatial epidemiology course dataset. It takes students from data preparation and neighbour definitions to Bayesian disease mapping with **R-INLA**.
+
+**Learning outcomes.** By the end of the session, students should be able to calculate population-based expected cases and observed-to-expected ratios; construct Queen-contiguity neighbours and an INLA graph; fit and compare Poisson, IID and BYM2 models; interpret area-level socioeconomic associations; map posterior relative risk, uncertainty and exceedance probabilities; and explain important limitations.
+
+**Numerical reproducibility.** The reference results were produced with a particular R-INLA build. Small numerical differences between software versions are normal; unexpected changes in model rankings, risk maps or classification counts deserve checking.
+
+**Files and workflow.** Place `QLD_SA2_Spatial_Epidemiology_Course.gpkg` in the same folder as R project. Open RStudio, set the working directory to that folder. The tutorial is designed to run **top to bottom in one fresh R session**. Fitting INLA models may take time. Outputs are saved to the working directory.
+
+**Data interpretation warning.** The case counts in this course dataset are used for teaching. The code assumes they correspond to the provided population denominators and one consistent observation period. It does **not** adjust for age, sex, reporting differences, or temporal variation; the ratio called `SIR` in the original script is therefore not a fully age-/sex-standardised incidence ratio.
+
+**Bayesian interpretation.** Credible intervals and exceedance probabilities are conditional on the selected likelihood, priors, adjacency graph and covariates. An ecological association is not individual-level causation.
+
+
+# Section 1: Getting started
+
+The following setup checks whether packages are installed and installs only missing ones. **INLA is installed from its official repository**, rather than CRAN. On subsequent renders, installed packages are simply loaded. If your teaching environment already has the packages, no installation is performed. Installation requires internet access only when a package is missing. The setup chunk is hidden from the rendered teaching handout, but remains available in the editable QMD.
+
+```{r}
+#| label: setup-packages
+#| include: false
+# Set the CRAN repository
+options(repos = c(CRAN = "https://cloud.r-project.org"))
+
+# Packages required for this tutorial
+packages <- c("sf", "dplyr", "ggplot2", "spdep")
+
+# Identify packages that are not installed
+missing_packages <- packages[
+  !vapply(packages, requireNamespace, logical(1), quietly = TRUE)
+]
+
+# Install only missing packages
+if (length(missing_packages) > 0) {
+  install.packages(missing_packages)
+}
+
+# Install INLA separately from its official repository
+if (!requireNamespace("INLA", quietly = TRUE)) {
+  
+  install.packages(
+    "INLA",
+    repos = c(
+      INLA = "https://inla.r-inla-download.org/R/stable",
+      CRAN = "https://cloud.r-project.org"
+    ),
+    dependencies = c("Depends", "Imports", "LinkingTo")
+  )
+}
+
+# Stop with a clear message if installation failed
+all_packages <- c(packages, "INLA")
+
+still_missing <- all_packages[
+  !vapply(all_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+
+if (length(still_missing) > 0) {
+  stop(
+    "These packages could not be installed: ",
+    paste(still_missing, collapse = ", "),
+    ". Please check the installation messages."
+  )
+}
+
+# Load all packages
+library(sf)
+library(dplyr)
+library(ggplot2)
+library(spdep)
+library(INLA)
+
+# Display INLA version
+packageVersion("INLA")
+
+cat("\nAll required packages loaded successfully!\n")
+```
+
+
+# Section 2: Data preparation
+
+
+## 2.1 Load the Queensland SA2 dataset
+
+An **SA2 (Statistical Area Level 2)** is a geographic unit used by the Australian Bureau of Statistics. We use the supplied Queensland GeoPackage as the spatial unit of analysis. Check the feature count, column names, and geometry before modelling.
+
+
+```{r}
+#| label: step-2-1
+#| output: false
+# Read the GeoPackage from the current working directory
+qld <- st_read("QLD_SA2_Spatial_Epidemiology_Course.gpkg", quiet = TRUE)
+
+# Check the dataset
+nrow(qld)
+names(qld)
+head(sf::st_drop_geometry(qld), 6)
+```
+
+**Check:** There should be **533 SA2 areas**. Each row must represent one polygonal area; its case count and population must refer to the same area and period.
+
+
+**Teaching check:** The input should contain 533 SA2 polygons. Inspect the `qld` object interactively in RStudio if you need to see its complete field list. The rendered document suppresses the initial file path and verbose import details.
+
+
+## 2.2 Map Queensland SA2 boundaries
+
+A boundary map is a basic spatial-data quality check. Look for missing polygons, unexpected geographic coverage, or unusual shapes.
+
+
+```{r}
+#| label: step-2-2
+print(
+  ggplot(qld) +
+    geom_sf(
+      fill = "lightblue",
+      colour = "grey50",
+      linewidth = 0.1
+    ) +
+    labs(
+      title = "Queensland SA2 Boundaries"
+    ) +
+    theme_minimal()
+)
+```
+
+**Discuss:** Why might very large rural SA2s visually dominate a map despite having relatively small populations?
+
+
+## 2.3 Summarise main variables
+
+Inspect the distributions of case counts, populations, and the Index of Relative Socio-economic Disadvantage (IRSD). Summaries help identify skewness and implausible values.
+
+
+```{r}
+#| label: step-2-3
+qld %>%
+  st_drop_geometry() %>%
+  select(CASES, POPULATION, IRSD_SCORE) %>%
+  summary()
+```
+
+**Interpretation:** IRSD is an area-level measure, not an individual-level exposure. Associations must not be interpreted as individual-level effects.
+
+
+## 2.4 Check data quality
+
+Bayesian Poisson models require nonnegative integer case counts and positive population denominators. Missing values or zero populations can make the expected-count offset invalid.
+
+
+```{r}
+#| label: step-2-4
+# Check missing values
+colSums(
+  is.na(
+    st_drop_geometry(qld)[,
+                          c("CASES", "POPULATION", "IRSD_SCORE")]
+  )
+)
+
+# Check invalid populations and case counts
+sum(qld$POPULATION <= 0, na.rm = TRUE)
+sum(qld$CASES < 0, na.rm = TRUE)
+
+# Stop if required values are missing or invalid
+if (
+  anyNA(qld$CASES) ||
+  anyNA(qld$POPULATION) ||
+  anyNA(qld$IRSD_SCORE) ||
+  any(qld$POPULATION <= 0, na.rm = TRUE) ||
+  any(qld$CASES < 0, na.rm = TRUE)
+) {
+  stop("Missing or invalid values found in the dataset.")
+}
+```
+
+**Check:** No missing values or invalid case counts/populations were found in the earlier tested data. The code stops if they appear in a new dataset.
+
+
+## 2.5 Standardise socioeconomic disadvantage
+
+Standardising IRSD subtracts its mean and divides by its standard deviation. The regression coefficient then represents a **one-standard-deviation** difference in IRSD.
+
+
+```{r}
+#| label: step-2-5
+# Standardise IRSD score
+qld$IRSD_z <- as.numeric(scale(qld$IRSD_SCORE))
+
+# Check standardisation
+summary(qld$IRSD_z)
+mean(qld$IRSD_z)
+sd(qld$IRSD_z)
+```
+
+**Remember:** A **higher IRSD** score indicates **less socioeconomic disadvantage**. The variable name `IRSD_z` means the standardised score.
+
+
+## 2.6 Calculate expected cases
+
+The overall Queensland notification rate is total cases divided by total population. Expected cases are each SA2 population multiplied by that overall rate.
+
+
+```{r}
+#| label: step-2-6
+# Overall disease rate
+overall_rate <- sum(qld$CASES) / sum(qld$POPULATION)
+
+# Expected cases for each SA2
+qld$Expected <- qld$POPULATION * overall_rate
+
+# Summarise expected cases
+summary(qld$Expected)
+```
+
+**Formula:** $E_i = N_i\times (\sum_i O_i / \sum_i N_i)$. These are **population-based expected counts**; no age or sex stratification is applied.
+
+
+## 2.7 Calculate observed-to-expected ratio (`SIR`)
+
+The observed-to-expected ratio compares reported cases with the number expected at the Queensland-wide rate. A value above 1 indicates more cases than expected.
+
+
+```{r}
+#| label: step-2-7
+# Calculate SIR
+qld$SIR <- qld$CASES / qld$Expected
+
+# Summarise SIR
+summary(qld$SIR)
+
+# Display example SA2 areas
+qld %>%
+  st_drop_geometry() %>%
+  select(SA2_NAME, CASES, POPULATION, Expected, SIR) %>%
+  head()
+```
+
+**Terminology correction:** The original variable name `SIR` is retained so the subsequent code still works, but the expected count is calculated as `POPULATION × overall crude rate`. Consequently, this is a **population-based observed-to-expected ratio**, not an age-/sex-standardised incidence ratio. An age-standardised SIR would require age-specific (and possibly sex-specific) reference rates and population strata. A value of 1 means observed and expected counts are equal under the crude-rate reference.
+
+
+## 2.8 Map observed-to-expected ratio (`SIR`)
+
+This map shows geographic variation in crude observed-to-expected ratios. Small areas with few expected cases may show unstable extreme ratios.
+
+
+```{r}
+#| label: step-2-8
+print(
+  ggplot(qld) +
+    geom_sf(aes(fill = SIR), colour = NA) +
+    scale_fill_gradient2(
+      low = "steelblue",
+      mid = "white",
+      high = "darkred",
+      midpoint = 1,
+      name = "Observed / expected"
+    ) +
+    labs(
+      title = "Observed-to-Expected Disease Incidence",
+      subtitle = "Queensland SA2 Areas"
+    ) +
+    theme_minimal()
+)
+```
+
+**Question:** Does a dark-red polygon necessarily represent strong evidence of elevated risk? Why not?
+
+
+## 2.9 Validate expected cases
+
+Because expected cases are calculated from the same overall observed rate, their sum should equal the total observed cases (up to floating-point rounding).
+
+
+```{r}
+#| label: step-2-9
+total_observed <- sum(qld$CASES)
+total_expected <- sum(qld$Expected)
+
+total_observed
+total_expected
+total_observed / total_expected
+
+# Save prepared dataset
+saveRDS(qld, "QLD_SA2_Session4_Prepared.rds")
+```
+
+**Expected:** Approximately **21,372 observed cases** and **21,372 expected cases**, with a total observed/expected ratio of 1.
+
+
+# Section 3: Spatial neighbourhood structure
+
+
+## 3.1 Create Queen contiguity neighbours
+
+Queen contiguity defines neighbours as polygons sharing either a border segment **or a vertex**. The resulting neighbour list supplies the spatial structure used by BYM2.
+
+
+```{r}
+#| label: step-3-1
+# Create Queen contiguity neighbour list
+qld_nb <- poly2nb(
+  qld,
+  queen = TRUE
+)
+
+# Display neighbourhood summary
+summary(qld_nb)
+```
+
+**Contrast:** Rook contiguity requires a shared border segment. Neighbour definitions are modelling choices, not properties of the disease.
+
+
+## 3.2 Examine number of neighbours
+
+Counting neighbours reveals geographic differences in connectivity and areas that have no land-border neighbour.
+
+
+```{r}
+#| label: step-3-2
+# Count neighbours for each SA2
+qld$N_NEIGHBOURS <- card(qld_nb)
+
+# Summarise neighbours
+summary(qld$N_NEIGHBOURS)
+
+# Average number of neighbours
+mean(qld$N_NEIGHBOURS)
+
+# Number of isolated SA2 areas
+sum(qld$N_NEIGHBOURS == 0)
+
+# List isolated SA2 areas
+qld %>%
+  st_drop_geometry() %>%
+  filter(N_NEIGHBOURS == 0) %>%
+  select(SA2_CODE, SA2_NAME, N_NEIGHBOURS)
+```
+
+**Expected:** **Seven isolated SA2s** in the tested dataset, including island areas. A warning about disconnected regions is anticipated; it should prompt inspection of the graph, not automatic modification of the data.
+
+
+## 3.3 Identify connected components
+
+A connected component is a group of areas joined by paths through the neighbour graph. Disconnected areas matter because structured spatial effects cannot borrow information across components.
+
+
+```{r}
+#| label: step-3-3
+# Identify disconnected groups
+components <- n.comp.nb(qld_nb)
+
+# Number of components
+components$nc
+
+# Size of each component
+table(components$comp.id)
+
+# Add component ID
+qld$COMPONENT <- components$comp.id
+```
+
+**Expected:** **Eight components**: one main group of 526 areas and seven singleton areas. Warnings about disconnected components are expected for this geography, not evidence that the analysis has failed. Each of the seven singleton areas has no Queen-contiguity neighbour. The BYM2 structured effect cannot borrow spatial information across these disconnected components; the model still uses the area’s own observations, covariate information and its unstructured component. Do not connect islands artificially just to eliminate the warning.
+
+
+## 3.4 Map number of neighbours
+
+Map the number of neighbours to see where the spatial graph is dense or sparse. Boundary and island areas often have fewer neighbours.
+
+
+```{r}
+#| label: step-3-4
+print(
+  ggplot(qld) +
+    geom_sf(
+      aes(fill = N_NEIGHBOURS),
+      colour = NA
+    ) +
+    scale_fill_viridis_c(
+      option = "magma",
+      direction = -1,
+      name = "Neighbours"
+    ) +
+    labs(
+      title = "Number of Queen-Contiguity Neighbours",
+      subtitle = "Queensland SA2 Areas"
+    ) +
+    theme_minimal()
+)
+```
+
+**Question:** How might a small number of neighbours affect the precision of a spatial random effect?
+
+
+## 3.5 Map isolated SA2 areas
+
+The island map highlights the seven areas with no Queen-contiguity neighbours.
+
+
+```{r}
+#| label: step-3-5
+# Identify isolated areas
+qld$ISOLATED <- ifelse(
+  qld$N_NEIGHBOURS == 0,
+  "No neighbours",
+  "Has neighbours"
+)
+
+# Create map
+print(
+  ggplot(qld) +
+    geom_sf(
+      aes(fill = ISOLATED),
+      colour = "grey70",
+      linewidth = 0.05
+    ) +
+    scale_fill_manual(
+      values = c(
+        "Has neighbours" = "lightgrey",
+        "No neighbours" = "red"
+      ),
+      name = "Neighbour status"
+    ) +
+    labs(
+      title = "Isolated Queensland SA2 Areas"
+    ) +
+    theme_minimal()
+)
+```
+
+**Interpretation:** An isolated area can still be modelled, but it has no adjacent polygons from which to borrow structured spatial information. This does not mean its relative risk is unestimable: the likelihood, fixed effects and unstructured component still contribute. Keep the true neighbourhood structure rather than adding artificial connections.
+
+
+## 3.6 Create binary adjacency matrix
+
+A binary adjacency matrix has a 1 for a neighbouring pair and 0 otherwise. For an undirected Queen-contiguity graph it should be symmetric.
+
+
+```{r}
+#| label: step-3-6
+# Convert neighbour list into binary adjacency matrix
+qld_mat <- nb2mat(
+  qld_nb,
+  style = "B",
+  zero.policy = TRUE
+)
+
+# Check matrix dimensions
+dim(qld_mat)
+
+# Check symmetry
+isSymmetric(qld_mat)
+
+# Display part of matrix
+qld_mat[1:10, 1:10]
+```
+
+**Expected:** A **533 × 533** symmetric matrix. The diagonal is zero because an area is not its own neighbour.
+
+
+## 3.7 Visualise neighbour network
+
+The neighbour-network plot draws connections between representative points in neighbouring polygons. The polygons are projected to Australian Albers (EPSG:3577) for a suitable Australian planar display.
+
+
+```{r}
+#| label: step-3-7
+# Project to Australian Albers
+qld_proj <- st_transform(qld, 3577)
+
+# Generate points inside polygons
+qld_points <- st_point_on_surface(qld_proj)
+
+# Extract coordinates
+coords <- st_coordinates(qld_points)
+
+# Plot polygons
+plot(
+  st_geometry(qld_proj),
+  col = "white",
+  border = "grey70",
+  main = "Queen-Contiguity Neighbour Network"
+)
+
+# Add neighbour connections
+plot(
+  qld_nb,
+  coords,
+  add = TRUE,
+  col = "blue",
+  lwd = 0.5
+)
+```
+
+**Note:** The points are placed on polygon surfaces for display; they are not necessarily geographic centroids.
+
+
+## 3.8 Create INLA spatial graph
+
+INLA uses an adjacency graph to represent which areas are neighbours. The graph must have the same number of nodes **and identical row order** as the modelling dataset.
+
+
+```{r}
+#| label: step-3-8
+# Convert neighbour list to an INLA adjacency file
+spdep::nb2INLA(
+  "QLD_SA2_Adjacency.adj",
+  qld_nb
+)
+
+# Read the adjacency file into INLA
+qld_graph <- INLA::inla.read.graph(
+  filename = "QLD_SA2_Adjacency.adj"
+)
+
+# Check graph size without printing the complete neighbour list
+qld_graph$n
+
+# Confirm graph size matches number of SA2 areas
+stopifnot(qld_graph$n == nrow(qld))
+```
+
+**Important:** Reordering SA2 rows after constructing the graph would silently attach neighbourhood relationships to the wrong areas.
+
+
+## 3.9 Create random effect identifiers
+
+Random-effect identifiers link each SA2 to its latent spatial and non-spatial effect. Each area receives a unique integer index.
+
+
+```{r}
+#| label: step-3-9
+# Structured spatial random effect
+qld$id.u <- seq_len(nrow(qld))
+
+# Unstructured random effect
+qld$id.v <- seq_len(nrow(qld))
+
+# Check identifiers
+qld %>%
+  st_drop_geometry() %>%
+  select(SA2_NAME, id.u, id.v) %>%
+  head()
+```
+
+**Note:** The original `id.u` and `id.v` fields are retained as a teaching illustration; Section 4 uses `IID_ID` and `BYM2_ID`.
+
+
+## 3.10 Save objects for Bayesian modelling
+
+Save intermediate data, neighbours, matrix, and graph so the analysis can be inspected or resumed without rebuilding the spatial objects.
+
+
+```{r}
+#| label: step-3-10
+saveRDS(
+  qld,
+  "QLD_SA2_Session4_Spatial_Prepared.rds"
+)
+
+saveRDS(
+  qld_nb,
+  "QLD_SA2_Session4_Neighbours.rds"
+)
+
+saveRDS(
+  qld_mat,
+  "QLD_SA2_Session4_Adjacency_Matrix.rds"
+)
+
+saveRDS(
+  qld_graph,
+  "QLD_SA2_Session4_INLA_Graph.rds"
+)
+```
+
+**Teaching point:** Saving an RDS object preserves its R structure; GeoPackage is more convenient for GIS software.
+
+
+## 3.11 Final summary
+
+Review the spatial-data preparation summary before fitting any Bayesian model.
+
+
+```{r}
+#| label: step-3-11
+cat("\n====================================\n")
+cat("SECTIONS 2 AND 3 COMPLETED\n")
+cat("====================================\n")
+
+cat("Number of SA2 areas:", nrow(qld), "\n")
+
+cat("Total observed cases:", total_observed, "\n")
+
+cat("Total expected cases:", round(total_expected, 2), "\n")
+
+cat(
+  "Average number of neighbours:",
+  round(mean(qld$N_NEIGHBOURS), 2),
+  "\n"
+)
+
+cat(
+  "Number of isolated SA2 areas:",
+  sum(qld$N_NEIGHBOURS == 0),
+  "\n"
+)
+
+cat(
+  "Number of connected components:",
+  components$nc,
+  "\n"
+)
+
+cat(
+  "INLA graph contains:",
+  qld_graph$n,
+  "areas\n"
+)
+
+cat("\nReady for Bayesian spatial modelling!\n")
+
+```
+
+**Expected:** 533 areas, seven isolated areas, and eight graph components.
+
+
+# Section 4: Bayesian Poisson and BYM2 models
+
+We model observed counts with expected cases as the exposure, compare three increasingly flexible models, and examine spatial smoothing.
+
+
+## 4.2 Check prepared data and spatial graph
+
+Keep the **same `qld` row order** as the graph created in Section 3. The model uses integer identifiers to associate one random effect with each SA2.
+
+
+```{r}
+#| label: step-4-2
+# Continue with the qld object prepared in Sections 2–3.
+# Its row order must match the adjacency graph.
+stopifnot(nrow(qld) == qld_graph$n)
+
+qld$AREA_ID <- seq_len(nrow(qld))
+qld$IID_ID <- seq_len(nrow(qld))
+qld$BYM2_ID <- seq_len(nrow(qld))
+
+stopifnot(
+  all(!is.na(qld$CASES)),
+  all(qld$CASES >= 0),
+  all(qld$CASES == floor(qld$CASES)),
+  all(is.finite(qld$Expected)),
+  all(qld$Expected > 0),
+  all(is.finite(qld$IRSD_z))
+)
+
+isolated <- which(qld_graph$nnbs == 0)
+cat("Number of SA2 areas:", nrow(qld), "\n")
+cat("Number of isolated SA2 areas:", length(isolated), "\n")
+print(sf::st_drop_geometry(qld[isolated, ])[, c("SA2_NAME", "CASES", "Expected")])
+```
+
+**Correction:** This consolidated document does not reload the older Section 2 dataset after constructing the graph. It carries the Section 3 object forward in memory.
+
+
+## 4.3 Model 1: Non-Spatial Poisson regression
+
+The baseline Poisson model includes IRSD but **no area-level random effects**. Expected counts enter as an exposure offset, so the model estimates relative risk rather than raw counts.
+
+
+```{r}
+#| label: step-4-3
+# This model investigates the relationship between
+# socioeconomic status and disease risk without random effects.
+
+formula_m1 <- CASES ~ 1 + IRSD_z
+
+model_m1 <- INLA::inla(
+  formula_m1,
+  family = "poisson",
+  data = st_drop_geometry(qld),
+  E = qld$Expected,
+  control.compute = list(
+    dic = TRUE,
+    waic = TRUE,
+    cpo = TRUE
+  ),
+  control.predictor = list(
+    compute = TRUE
+  )
+)
+
+# Display model results
+print(model_m1$summary.fixed)
+
+# Exponentiate the IRSD coefficient to obtain a relative risk
+exp(model_m1$summary.fixed["IRSD_z", "mean"])
+```
+
+**Model:** $O_i\sim\operatorname{Poisson}(E_i\theta_i)$ and $\log(\theta_i)=\alpha+\beta\,IRSD_{z,i}$.
+
+
+## 4.4 Model 2: unstructured random effects
+
+The IID model adds one **independent, unstructured random effect** for each SA2. It accounts for extra area-to-area variation but does not assume neighbouring SA2s are more alike.
+
+
+```{r}
+#| label: step-4-4
+# Each SA2 receives an independent random effect.
+# Neighbouring areas are not assumed to have similar risks.
+
+formula_m2 <- CASES ~ 1 + IRSD_z +
+  f(
+    IID_ID,
+    model = "iid",
+    hyper = list(
+      prec = list(
+        prior = "pc.prec",
+        param = c(1, 0.01)
+      )
+    )
+  )
+
+model_m2 <- INLA::inla(
+  formula_m2,
+  family = "poisson",
+  data = st_drop_geometry(qld),
+  E = qld$Expected,
+  control.compute = list(
+    dic = TRUE,
+    waic = TRUE,
+    cpo = TRUE
+  ),
+  control.predictor = list(
+    compute = TRUE
+  )
+)
+
+print(model_m2$summary.fixed)
+print(model_m2$summary.hyperpar)
+```
+
+**Question:** Why might adding IID effects improve fit even if there is no geographic pattern in the residuals?
+
+
+## 4.5 Model 3: Bayesian BYM2 spatial model
+
+BYM2 combines a spatially structured effect (nearby SA2s tend to have similar residual risks) with an unstructured effect (SA2-specific variation that is not spatially correlated). In the **scaled BYM2 parameterisation**, `phi` is the mixing parameter that allocates a share of the **latent random-effect variance** to the structured component, under the model's scaling conventions. It is **not** the percentage of all observed variation in case counts explained by geography, nor the percentage of disease risk caused by location. For example, a posterior `phi` close to 1 suggests that the model allocates most of the latent random-effect variance to its spatially structured component; it does not mean that geography explains nearly 100% of disease occurrence. Interpret `phi` together with the overall random-effect precision and the model assumptions, especially because the graph contains disconnected components.
+
+
+```{r}
+#| label: step-4-5
+# BYM2 combines:
+# 1. Spatially structured random variation
+# 2. Spatially unstructured random variation
+#
+# The graph contains seven isolated SA2 areas.
+# INLA handles them as singleton components.
+
+formula_m3 <- CASES ~ 1 + IRSD_z +
+  f(
+    BYM2_ID,
+    model = "bym2",
+    graph = qld_graph,
+    scale.model = TRUE,
+    adjust.for.con.comp = TRUE,
+    constr = TRUE,
+    hyper = list(
+      prec = list(
+        prior = "pc.prec",
+        param = c(1, 0.01)
+      ),
+      phi = list(
+        prior = "pc",
+        param = c(0.5, 0.5)
+      )
+    )
+  )
+
+model_m3 <- INLA::inla(
+  formula_m3,
+  family = "poisson",
+  data = st_drop_geometry(qld),
+  E = qld$Expected,
+  control.compute = list(
+    dic = TRUE,
+    waic = TRUE,
+    cpo = TRUE,
+    return.marginals.predictor = TRUE
+  ),
+  control.predictor = list(
+    compute = TRUE
+  )
+)
+
+print(model_m3$summary.fixed)
+print(model_m3$summary.hyperpar)
+
+# Required for Section 5: one fitted-risk posterior marginal per SA2.
+stopifnot(length(model_m3$marginals.fitted.values) == nrow(qld))
+```
+
+**Essential INLA correction:** `return.marginals.predictor = TRUE` belongs inside **`control.compute`**, not `control.predictor`. This allows Section 5 to calculate exceedance probabilities without refitting. The graph includes seven singleton islands, handled through the disconnected-component settings.
+
+
+## 4.6 Compare the three models
+
+DIC and WAIC compare the fitted models while accounting for complexity; **lower values are generally preferable**. Compare the change from Poisson to IID (extra area-level heterogeneity), then from IID to BYM2 (additional spatial structure). A lower value supports the model for these data under these assumptions; it does **not** establish causality or guarantee better out-of-sample predictions. Formal predictive assessment would require held-out data or suitable spatial/temporal validation.
+
+
+```{r}
+#| label: step-4-6
+# Lower DIC and WAIC generally indicate better model fit,
+# although model complexity and predictive performance matter.
+
+model_comparison <- data.frame(
+  Model = c(
+    "Poisson",
+    "Poisson + IID",
+    "Poisson + BYM2"
+  ),
+  DIC = c(
+    model_m1$dic$dic,
+    model_m2$dic$dic,
+    model_m3$dic$dic
+  ),
+  WAIC = c(
+    model_m1$waic$waic,
+    model_m2$waic$waic,
+    model_m3$waic$waic
+  )
+)
+
+print(model_comparison)
+```
+
+**Reproducibility note:** The figures below are reference values from one successful run, not exact values students must reproduce to every decimal place. INLA versions, numerical optimisation settings and computing environments can lead to small differences in posterior summaries and information criteria. Students should focus on the direction, magnitude and interpretation of results; substantial discrepancies should be investigated.
+
+**Expected result from the supplied teaching dataset:** Poisson DIC/WAIC ≈ 4559/4564; IID ≈ 3740/3707; BYM2 ≈ 3539/3513. BYM2 had the lowest DIC and WAIC among the three fitted models. The substantial improvement from Poisson to IID suggests unmodelled area-level heterogeneity; the additional improvement from IID to BYM2 suggests that representing spatial structure improves the model’s balance of fit and complexity. These are *relative in-sample comparisons*, not proof that BYM2 will predict new observations better or that the spatial pattern is causal.
+
+
+**Discuss:** Why can adding independent SA2 effects improve fit even without spatial neighbours? What additional assumption does BYM2 introduce? Why is the lowest WAIC not the same as externally validated predictive performance?
+
+
+## 4.7 Examine socioeconomic associations
+
+Exponentiating the IRSD coefficient gives a multiplicative relative risk for a one-standard-deviation higher IRSD score. A ratio below 1 means lower estimated risk in **more advantaged** areas.
+
+
+```{r}
+#| label: step-4-7
+# Convert regression coefficients into relative risks.
+# A relative risk above 1 indicates higher expected risk.
+
+fixed_effects <- data.frame(
+  Model = c("Poisson", "IID", "BYM2"),
+  RR = exp(c(
+    model_m1$summary.fixed["IRSD_z", "mean"],
+    model_m2$summary.fixed["IRSD_z", "mean"],
+    model_m3$summary.fixed["IRSD_z", "mean"]
+  )),
+  Lower95 = exp(c(
+    model_m1$summary.fixed["IRSD_z", "0.025quant"],
+    model_m2$summary.fixed["IRSD_z", "0.025quant"],
+    model_m3$summary.fixed["IRSD_z", "0.025quant"]
+  )),
+  Upper95 = exp(c(
+    model_m1$summary.fixed["IRSD_z", "0.975quant"],
+    model_m2$summary.fixed["IRSD_z", "0.975quant"],
+    model_m3$summary.fixed["IRSD_z", "0.975quant"]
+  ))
+)
+
+print(fixed_effects)
+
+# Important:
+# Higher IRSD scores represent LESS socioeconomic disadvantage.
+# Therefore, RR > 1 means higher risk in more advantaged areas,
+# while RR < 1 means lower risk in more advantaged areas.
+```
+
+**Reproducibility note:** The figures below are reference values from one successful run, not exact values students must reproduce to every decimal place. INLA versions, numerical optimisation settings and computing environments can lead to small differences in posterior summaries and information criteria. Students should focus on the direction, magnitude and interpretation of results; substantial discrepancies should be investigated.
+
+**Expected result from the supplied teaching dataset:** BYM2 RR ≈ **0.941** (95% credible interval **0.918–0.965**), or about 5.9% lower risk per SD higher IRSD. This is an area-level association, not a causal effect.
+
+
+## 4.8 Extract correct Bayesian relative risks
+
+The fitted values from this INLA Poisson model using `E` are already on the **relative-risk scale**. Use them directly for posterior means and credible limits.
+
+
+```{r}
+#| label: step-4-8
+# INLA fitted values are already on the relative-risk scale
+# when using the E argument in this model specification.
+
+qld$RR_BAYES <- model_m3$summary.fitted.values$mean
+
+qld$RR_LOWER <- model_m3$summary.fitted.values$`0.025quant`
+
+qld$RR_UPPER <- model_m3$summary.fitted.values$`0.975quant`
+
+# Check results
+print(
+  qld %>%
+    st_drop_geometry() %>%
+    select(
+      SA2_NAME,
+      CASES,
+      Expected,
+      SIR,
+      RR_BAYES,
+      RR_LOWER,
+      RR_UPPER
+    ) %>%
+    head(10)
+)
+
+# Summarise Bayesian relative risks
+summary(qld$RR_BAYES)
+```
+
+**Essential correction:** **Do not divide `summary.fitted.values` by `Expected` again.** That earlier mistake created implausibly small relative risks and invalid classifications.
+
+
+## 4.9 Map Bayesian relative risk
+
+A smoothed relative-risk map displays posterior estimates informed by observed counts, socioeconomic status, and spatial structure.
+
+
+```{r}
+#| label: step-4-9
+print(
+  ggplot(qld) +
+    geom_sf(
+      aes(fill = RR_BAYES),
+      colour = NA
+    ) +
+    scale_fill_gradient2(
+      low = "steelblue",
+      mid = "white",
+      high = "darkred",
+      midpoint = 1,
+      name = "Relative risk"
+    ) +
+    labs(
+      title = "Bayesian Spatial Disease Risk",
+      subtitle = "Queensland SA2 Areas: BYM2 Model"
+    ) +
+    theme_minimal()
+)
+```
+
+**Example:** In the earlier output, Bouldercombe changed from crude ratio **2.36** to smoothed Bayesian RR **1.53**.
+
+
+## 4.10 Compare crude and Bayesian risk
+
+Compare crude and smoothed risk maps using a shared colour scale. Differences illustrate the effect of modelling and spatial smoothing.
+
+
+```{r}
+#| label: step-4-10
+# Use the same colour limits for both maps
+# so students can compare them meaningfully.
+
+common_max <- max(qld$SIR, qld$RR_BAYES, na.rm = TRUE)
+# Keep the reference value 1 at the colour midpoint on both maps.
+# A shared scale permits direct comparison; extreme crude SIRs may
+# compress visual differences, which is a useful discussion point.
+
+print(
+  ggplot(qld) +
+    geom_sf(aes(fill = SIR), colour = NA) +
+    scale_fill_gradient2(
+      low = "steelblue",
+      mid = "white",
+      high = "darkred",
+      midpoint = 1,
+      limits = c(0, common_max),
+      name = "Relative risk"
+    ) +
+    labs(
+      title = "Crude Observed-to-Expected Ratio"
+    ) +
+    theme_minimal()
+)
+
+print(
+  ggplot(qld) +
+    geom_sf(aes(fill = RR_BAYES), colour = NA) +
+    scale_fill_gradient2(
+      low = "steelblue",
+      mid = "white",
+      high = "darkred",
+      midpoint = 1,
+      limits = c(0, common_max),
+      name = "Relative risk"
+    ) +
+    labs(
+      title = "Smoothed Bayesian Relative Risk"
+    ) +
+    theme_minimal()
+)
+```
+
+**Caution:** A shared scale may reduce contrast in the smoothed map if a crude outlier is very high. A sensitivity map with capped display values may help, but should be clearly labelled.
+
+
+## 4.11 Classify areas by posterior credible interval
+
+A central 95% credible interval entirely above 1 supports elevated risk; entirely below 1 supports reduced risk. Otherwise the direction remains uncertain at this threshold.
+
+
+```{r}
+#| label: step-4-11
+qld$RISK_CLASS <- ifelse(
+  qld$RR_LOWER > 1,
+  "Higher risk",
+  ifelse(
+    qld$RR_UPPER < 1,
+    "Lower risk",
+    "Uncertain"
+  )
+)
+
+# Display the corrected number of SA2 areas
+print(table(qld$RISK_CLASS))
+
+# Map classifications
+print(
+  ggplot(qld) +
+    geom_sf(
+      aes(fill = RISK_CLASS),
+      colour = NA
+    ) +
+    scale_fill_manual(
+      values = c(
+        "Higher risk" = "darkred",
+        "Lower risk" = "steelblue",
+        "Uncertain" = "grey85"
+      ),
+      name = "Risk classification"
+    ) +
+    labs(
+      title = "Bayesian Disease Risk Classification",
+      subtitle = "Based on 95% marginal credible intervals"
+    ) +
+    theme_minimal()
+)
+```
+
+**Reproducibility note:** The figures below are reference values from one successful run, not exact values students must reproduce to every decimal place. INLA versions, numerical optimisation settings and computing environments can lead to small differences in posterior summaries and information criteria. Students should focus on the direction, magnitude and interpretation of results; substantial discrepancies should be investigated.
+
+**Expected result from the supplied teaching dataset:** **96 higher**, **106 lower**, **331 uncertain**. These are marginal interval decisions and do not adjust for 533 simultaneous comparisons.
+
+
+## 4.12 Save corrected results
+
+Save the fitted models and the corrected spatial results for reproducibility and subsequent GIS use.
+
+
+```{r}
+#| label: step-4-12
+saveRDS(
+  qld,
+  "QLD_SA2_Session4_Bayesian_Results.rds"
+)
+
+st_write(
+  qld,
+  "QLD_SA2_Bayesian_Results.gpkg",
+  delete_dsn = TRUE,
+  quiet = TRUE
+)
+
+cat("\nCORRECTED BAYESIAN RESULTS SAVED SUCCESSFULLY!\n")
+
+# SESSION 4: BAYESIAN SPATIAL DISEASE MAPPING IN R
+
+saveRDS(model_m1, "QLD_SA2_Model1_Poisson.rds")
+saveRDS(model_m2, "QLD_SA2_Model2_IID.rds")
+saveRDS(model_m3, "QLD_SA2_Model3_BYM2.rds")
+write.csv(model_comparison, "QLD_SA2_Model_Comparison.csv", row.names = FALSE)
+```
+
+**Practical note:** Close a GeoPackage in QGIS if Windows prevents it being overwritten.
+
+
+# Section 5: Exceedance probabilities and uncertainty
+
+This section asks how certain we are that risk exceeds 1, not only what its posterior mean is.
+
+
+## 5.1 Load packages and existing results
+
+Continue directly with the model fitted in Section 4.5. The posterior marginals are now available because the correct INLA setting was included there.
+
+
+```{r}
+#| label: step-5-1
+# Continue directly from Section 4: qld and model_m3 are already in memory.
+stopifnot(
+  nrow(model_m3$summary.fitted.values) == nrow(qld),
+  length(model_m3$marginals.fitted.values) == nrow(qld)
+)
+summary(qld$RR_BAYES)
+```
+
+**Check:** The number of fitted-value marginal distributions must equal **533**.
+
+
+## 5.2 Calculate posterior exceedance probabilities
+
+An exceedance probability is $P(\theta_i>1\mid\mathrm{data})$: the posterior probability that area-level relative risk exceeds the reference value 1.
+
+
+```{r}
+#| label: step-5-2
+# Exceedance probability is:
+# P(Relative Risk > 1 | Data)
+#
+# Values close to 1 indicate strong evidence of elevated risk.
+# Values close to 0 indicate strong evidence of reduced risk.
+# Values near 0.5 indicate uncertainty about the direction.
+
+# INLA provides marginal posterior distributions
+# for fitted relative risks.
+
+# Check that the marginal distributions are available
+if (length(model_m3$marginals.fitted.values) != nrow(qld)) {
+  stop("Missing posterior marginals: set return.marginals.predictor = TRUE ",
+       "inside control.compute in the BYM2 fit (Section 4.5).")
+}
+
+# Calculate P(RR > 1) for every SA2
+qld$PROB_RR_GT1 <- vapply(
+  model_m3$marginals.fitted.values,
+  function(marginal) {
+    1 - INLA::inla.pmarginal(1, marginal)
+  },
+  numeric(1)
+)
+
+# Check the range
+summary(qld$PROB_RR_GT1)
+
+# All probabilities should be between 0 and 1
+stopifnot(
+  all(is.finite(qld$PROB_RR_GT1)),
+  all(qld$PROB_RR_GT1 >= 0),
+  all(qld$PROB_RR_GT1 <= 1)
+)
+
+# Display examples
+print(
+  qld %>%
+    st_drop_geometry() %>%
+    select(
+      SA2_NAME,
+      SIR,
+      RR_BAYES,
+      RR_LOWER,
+      RR_UPPER,
+      PROB_RR_GT1
+    ) %>%
+    head(10)
+)
+```
+
+**Examples:** Daintree ≈ **0.9962**; Balonne ≈ **0.5945**; McDowall ≈ **0.000028**. Values printed as exactly 0 or 1 may reflect numerical precision, not absolute certainty.
+
+
+## 5.3 Map posterior exceedance probabilities
+
+A probability map visualises the **strength of posterior evidence** for elevated risk, rather than the estimated magnitude of risk.
+
+
+```{r}
+#| label: step-5-3
+# Darker colours indicate greater probability
+# that the relative risk exceeds 1.
+
+print(
+  ggplot(qld) +
+    geom_sf(
+      aes(fill = PROB_RR_GT1),
+      colour = NA
+    ) +
+    scale_fill_gradient(
+      low = "white",
+      high = "darkred",
+      limits = c(0, 1),
+      name = "P(RR > 1)"
+    ) +
+    labs(
+      title = "Posterior Probability of Elevated Disease Risk",
+      subtitle = "Queensland SA2 Areas: BYM2 Model"
+    ) +
+    theme_minimal()
+)
+```
+
+**Question:** Can an SA2 have RR = 1.3 but a less convincing exceedance probability than another SA2 with RR = 1.2? Explain using uncertainty.
+
+
+## 5.4 Classify areas using exceedance probabilities
+
+Use one-sided thresholds: above 0.95 for evidence of elevated risk, below 0.05 for evidence of reduced risk, and otherwise uncertain. **These are illustrative marginal thresholds, not a multiplicity-adjusted decision rule for simultaneously selecting 533 priority areas.** Interpret the resulting map as a teaching exercise, not as a definitive public-health prioritisation list.
+
+
+```{r}
+#| label: step-5-4
+# Thresholds used for teaching:
+#
+# P(RR > 1) > 0.95: Strong evidence of elevated risk
+# P(RR > 1) < 0.05: Strong evidence of reduced risk
+# Otherwise: Uncertain
+
+qld$PROB_CLASS <- ifelse(
+  qld$PROB_RR_GT1 > 0.95,
+  "Higher risk",
+  ifelse(
+    qld$PROB_RR_GT1 < 0.05,
+    "Lower risk",
+    "Uncertain"
+  )
+)
+
+# Display number of SA2 areas in each category
+print(table(qld$PROB_CLASS))
+
+# Map probability-based risk classification
+print(
+  ggplot(qld) +
+    geom_sf(
+      aes(fill = PROB_CLASS),
+      colour = "grey70",
+      linewidth = 0.05
+    ) +
+    scale_fill_manual(
+      values = c(
+        "Higher risk" = "darkred",
+        "Lower risk" = "steelblue",
+        "Uncertain" = "grey85"
+      ),
+      name = "Risk classification"
+    ) +
+    labs(
+      title = "Bayesian Exceedance Probability Classification",
+      subtitle = "Thresholds: >0.95 elevated; <0.05 reduced"
+    ) +
+    theme_minimal()
+)
+```
+
+**Reproducibility note:** The figures below are reference values from one successful run, not exact values students must reproduce to every decimal place. INLA versions, numerical optimisation settings and computing environments can lead to small differences in posterior summaries and information criteria. Students should focus on the direction, magnitude and interpretation of results; substantial discrepancies should be investigated.
+
+**Expected result from the supplied teaching dataset:** **110 higher**, **138 lower**, **285 uncertain**. These thresholds are illustrative, not a joint or multiplicity-adjusted decision rule.
+
+
+## 5.5 Map posterior uncertainty
+
+The posterior standard deviation measures **absolute uncertainty** in estimated relative risk. Larger SD indicates less precise estimates.
+
+
+```{r}
+#| label: step-5-5
+# Posterior standard deviation measures uncertainty
+# in the estimated relative risk.
+#
+# Higher values indicate less precise estimates.
+
+qld$RR_SD <- model_m3$summary.fitted.values$sd
+
+# Summarise uncertainty
+summary(qld$RR_SD)
+
+# Map posterior standard deviation
+print(
+  ggplot(qld) +
+    geom_sf(
+      aes(fill = RR_SD),
+      colour = NA
+    ) +
+    scale_fill_viridis_c(
+      option = "magma",
+      direction = -1,
+      name = "Posterior SD"
+    ) +
+    labs(
+      title = "Uncertainty in Bayesian Relative Risk",
+      subtitle = "Posterior Standard Deviation"
+    ) +
+    theme_minimal()
+)
+```
+
+**Reproducibility note:** The figures below are reference values from one successful run, not exact values students must reproduce to every decimal place. INLA versions, numerical optimisation settings and computing environments can lead to small differences in posterior summaries and information criteria. Students should focus on the direction, magnitude and interpretation of results; substantial discrepancies should be investigated.
+
+**Expected result from the supplied teaching dataset:** Median SD ≈ **0.0975**; range **0.0549–0.3148**. Absolute SD also depends on RR magnitude, so comparisons deserve care.
+
+
+## 5.6 Examine uncertainty and population size
+
+Plot posterior SD against SA2 population and calculate Spearman rank correlation. This checks whether larger populations tend to have more precise estimates.
+
+
+```{r}
+#| label: step-5-6
+# Small-population areas often have less precise estimates,
+# although spatial borrowing of information can modify this.
+
+# Scatterplot of population against posterior SD
+print(
+  ggplot(
+    st_drop_geometry(qld),
+    aes(
+      x = POPULATION,
+      y = RR_SD
+    )
+  ) +
+    geom_point(
+      colour = "steelblue",
+      alpha = 0.5
+    ) +
+    geom_smooth(
+      method = "loess",
+      se = TRUE,
+      colour = "darkred"
+    ) +
+    labs(
+      title = "Population Size and Bayesian Uncertainty",
+      x = "SA2 Population",
+      y = "Posterior SD of Relative Risk"
+    ) +
+    theme_minimal()
+)
+
+# Calculate Spearman correlation
+cor.test(
+  qld$POPULATION,
+  qld$RR_SD,
+  method = "spearman",
+  exact = FALSE
+)
+```
+
+**Reproducibility note:** The figures below are reference values from one successful run, not exact values students must reproduce to every decimal place. INLA versions, numerical optimisation settings and computing environments can lead to small differences in posterior summaries and information criteria. Students should focus on the direction, magnitude and interpretation of results; substantial discrepancies should be investigated.
+
+**Expected result from the supplied teaching dataset:** Spearman $\rho\approx-0.595$, $p<2.2\times10^{-16}$. This is an association, not proof that population alone causes the uncertainty pattern.
+
+
+## 5.7 Identify areas with strong evidence of high risk
+
+Rank SA2s by exceedance probability to identify examples with strong posterior evidence of elevated risk.
+
+
+```{r}
+#| label: step-5-7
+# Display the 10 areas with the highest
+# posterior probability of elevated risk.
+
+high_risk_areas <- qld %>%
+  st_drop_geometry() %>%
+  arrange(desc(PROB_RR_GT1)) %>%
+  select(
+    SA2_NAME,
+    POPULATION,
+    CASES,
+    SIR,
+    RR_BAYES,
+    PROB_RR_GT1
+  ) %>%
+  head(10)
+
+print(high_risk_areas)
+```
+
+**Important:** Values near 1 often tie numerically; the first ten listed are not necessarily the ten largest **risk magnitudes**. Use RR and uncertainty alongside the probability.
+
+
+## 5.8 Identify areas with strong evidence of low risk
+
+Rank SA2s by low exceedance probability to identify areas with strong posterior evidence of reduced risk.
+
+
+```{r}
+#| label: step-5-8
+low_risk_areas <- qld %>%
+  st_drop_geometry() %>%
+  arrange(PROB_RR_GT1) %>%
+  select(
+    SA2_NAME,
+    POPULATION,
+    CASES,
+    SIR,
+    RR_BAYES,
+    PROB_RR_GT1
+  ) %>%
+  head(10)
+
+print(low_risk_areas)
+```
+
+**Interpretation:** A low probability of RR > 1 is not the same as zero disease burden.
+
+
+## 5.9 Compare credible-interval and exceedance classifications
+
+Compare central 95% credible-interval classification with one-sided 0.95/0.05 exceedance thresholds. They need not agree because the thresholds differ.
+
+
+```{r}
+#| label: step-5-9
+# Section 4 used 95% credible intervals.
+# Section 5 uses posterior probability thresholds.
+#
+# They need not classify exactly the same areas because
+# the thresholds are not equivalent.
+
+print(
+  table(
+    Credible_Interval = qld$RISK_CLASS,
+    Exceedance_Probability = qld$PROB_CLASS
+  )
+)
+```
+
+**Reproducibility note:** The figures below are reference values from one successful run, not exact values students must reproduce to every decimal place. INLA versions, numerical optimisation settings and computing environments can lead to small differences in posterior summaries and information criteria. Students should focus on the direction, magnitude and interpretation of results; substantial discrepancies should be investigated.
+
+**Expected result from the supplied teaching dataset:** All **202** areas classified higher/lower by central 95% intervals kept their class; exceedance thresholds additionally classified **14 higher** and **32 lower**.
+
+
+## 5.10 Save results
+
+Save the complete Section 5 dataset and ranked CSVs. The GeoPackage can be opened directly in QGIS for further exploration.
+
+
+```{r}
+#| label: step-5-10
+# Save complete dataset
+saveRDS(
+  qld,
+  "QLD_SA2_Session5_Bayesian_Results.rds"
+)
+
+# Save spatial layer for QGIS
+st_write(
+  qld,
+  "QLD_SA2_Session5_Bayesian_Results.gpkg",
+  delete_dsn = TRUE,
+  quiet = TRUE
+)
+
+# Save high-risk areas
+write.csv(
+  high_risk_areas,
+  "QLD_SA2_High_Risk_Areas.csv",
+  row.names = FALSE
+)
+
+# Save low-risk areas
+write.csv(
+  low_risk_areas,
+  "QLD_SA2_Low_Risk_Areas.csv",
+  row.names = FALSE
+)
+
+cat(
+  "\nSECTION 5 COMPLETED SUCCESSFULLY!\n"
+)
+```
+
+**Output:** An RDS file, a GeoPackage, and two CSV tables of high- and low-exceedance areas.
+
+
+# Final teaching synthesis
+
+### Model comparison and spatial interpretation
+
+The Poisson model assumes that IRSD explains systematic variation and that no additional area-level random effects are needed. The IID model allows unexplained differences among SA2s but does not use neighbourhood information. BYM2 adds a structured component, allowing neighbouring areas to share information, while retaining an unstructured component. The fitted BYM2 spatial mixing parameter was approximately **0.985** in the earlier run, indicating a high share of latent variation allocated to the structured component **under this model and its priors**. It does not mean that 98.5% of disease cases are caused by geography.
+
+### Suggested discussion questions
+
+1. Why can a crude observed-to-expected ratio be extreme when expected counts are small?
+2. Why do the seven island SA2s require special attention in a contiguity-based spatial model?
+3. How does the IRSD effect change between the Poisson and BYM2 models, and what could explain this?
+4. Why is a posterior RR of 1.3 not enough, by itself, to conclude that an area has elevated risk?
+5. Why do one-sided 0.95 exceedance thresholds classify more areas than central 95% credible intervals?
+6. What limitations arise from ecological data, population-based expected counts, spatial confounding and the chosen adjacency structure?
+
+### Practical limitations and extensions
+
+- **No demographic standardisation:** Age- and sex-specific reference rates would be required for a conventional standardised incidence ratio.
+- **No spatial sensitivity analysis:** Queen versus rook or distance-based neighbours could be compared in a later exercise.
+- **No external prediction assessment:** DIC and WAIC are not a substitute for independent or spatially blocked validation.
+- **No multiplicity adjustment:** The risk classifications are marginal, area-by-area summaries.
+- **No causal interpretation:** IRSD is ecological and may be correlated with omitted factors.
+- **No temporal modelling:** This tutorial analyses spatial variation only.
+
+
+**End of Session 4.**
