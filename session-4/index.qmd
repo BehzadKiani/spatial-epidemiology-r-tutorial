@@ -3,6 +3,7 @@ title: "Session 4 | Bayesian Spatial Disease Mapping in R"
 subtitle: "Queensland SA2 practical: Poisson, IID, BYM2, exceedance probabilities and uncertainty"
 author: "Spatial Epidemiology Course"
 date: "2026-10-15"
+
 format:
   html:
     toc: true
@@ -12,6 +13,8 @@ format:
     code-copy: true
     theme: cosmo
     embed-resources: true
+    self-contained-math: true
+
 execute:
   echo: true
   warning: false
